@@ -1,4 +1,7 @@
-.PHONY: install lint format test up down logs smoke
+ETL_INPUT ?= data/raw
+ETL_OUTPUT ?= data/processed
+
+.PHONY: install lint format test historical-etl up down logs smoke
 
 install:
 	uv sync --group dev
@@ -12,7 +15,10 @@ format:
 	uv run ruff format .
 
 test:
-	uv run pytest
+	uv run python -m pytest
+
+historical-etl:
+	uv run flight-delay-etl --input "$(ETL_INPUT)" --output "$(ETL_OUTPUT)"
 
 up:
 	docker compose up --build -d

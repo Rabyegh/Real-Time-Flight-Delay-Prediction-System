@@ -34,6 +34,9 @@ orchestration = [
 requires = ["hatchling>=1.27,<2"]
 build-backend = "hatchling.build"
 
+[project.scripts]
+flight-delay-etl = "flight_delay.processing.historical_etl:main"
+
 [tool.hatch.build.targets.wheel]
 packages = ["src/flight_delay"]
 
