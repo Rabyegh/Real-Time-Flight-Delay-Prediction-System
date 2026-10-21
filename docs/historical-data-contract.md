@@ -101,3 +101,40 @@ that it uniquely identifies a flight.
 
 The raw files are local inputs and are excluded by `.gitignore`; neither these
 files nor generated Parquet outputs belong in Git.
+
+## Phase 2 feature store and prediction target contract
+
+### Prediction target definition
+
+- **Target column:** `is_delayed_15` (integer `0` or `1`).
+- **Classification rule:**
+  - `1`: Departure delay is at least 15 minutes (`DEP_DELAY >= 15.0`).
+  - `0`: Departure delay is less than 15 minutes (`DEP_DELAY < 15.0`).
+- **Source semantics:** `DEP_DELAY` is measured in elapsed minutes. Measured against `DEP_DEL15` on accepted records, zero discrepancies were observed across all 1,059,589 labeled rows.
+- **Missing and unobserved outcomes:** Records with missing departure delay outcomes (`DEP_DELAY IS NULL` or `DEP_DEL15 IS NULL`) are excluded from model training datasets with reason `missing_target:DEP_DELAY`. Because the source files lack explicit cancellation flags, missing actual departure times or delays cannot be reliably classified as either on-time or delayed; they are never silently imputed to zero.
+
+### Prediction-time assumption
+
+Predictions are made strictly prior to departure (at or before scheduled departure time `CRS_DEP_TIME`). Consequently, all actual post-departure outcome fields are prohibited from the feature set.
+
+### Feature allowlist and prohibited leakage fields
+
+| Category | Allowed columns | Prohibited leakage columns | Rationale |
+| --- | --- | --- | --- |
+| **Target & direct derivatives** | None | `DEP_DELAY`, `DEP_DEL15` | Direct ground-truth target leakage. |
+| **Post-departure actual outcomes** | None | `DEP_TIME`, `ARR_DELAY` | Unknown prior to flight departure. |
+| **Pipeline artifacts & hashes** | None | `source_file`, `_row_fingerprint`, `raw_record_fields`, `raw_extra_fields` | ETL implementation artifacts. |
+| **Identifiers / invariant memorization** | None | `FL_DATE`, `YEAR`, `flight_year`, `flight_month`, `ORIGIN_CITY_NAME`, `ORIGIN_STATE_NM`, `DEST_CITY_NAME`, `DEST_STATE_NM` | Date text and constant 2023 year risk memorization; city/state names are 1-to-1 redundant with airport codes. |
+| **Pre-departure routing** | `carrier`, `origin`, `dest`, `crs_elapsed_time`, `distance` | None | Carrier and airport IATA codes, planned duration and distance. |
+| **Pre-departure schedules** | `crs_dep_hour`, `crs_dep_minute`, `dep_time_blk`, `crs_arr_hour`, `crs_arr_minute`, `arr_time_blk` | None | Extracted planned hours, minutes, and BTS scheduled time blocks. |
+| **Calendar components** | `month`, `day_of_month`, `day_of_week`, `is_weekend` | None | Bounded calendar features derived from scheduled flight date. |
+
+### Feature quality and reconciliation
+
+- **Exclusion rules:** Records with missing delay outcomes, missing required features (e.g. null `CRS_ELAPSED_TIME`), or nonpositive duration/distance are excluded with explicit reason tags.
+- **Dataset reconciliation:** On the 2023 curated extracts, all 1,080,011 input rows reconcile exactly:
+  - Input rows: 1,080,011
+  - Eligible rows: 1,059,588
+  - Excluded rows: 20,423 (`missing_target:DEP_DELAY`: 20,422; `missing_feature:crs_elapsed_time`: 1)
+  - Target distribution: 815,913 negative (0), 243,675 positive (1) (22.997% positive rate).
+  - Missing feature counts in eligible rows: 0 across all 15 allowlisted features.

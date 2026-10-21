@@ -141,6 +141,8 @@ def _new_spark_session(master: str) -> SparkSession:
         .config("spark.ui.enabled", "false")
         .config("spark.sql.shuffle.partitions", "8")
         .config("spark.sql.ansi.enabled", "false")
+        .config("spark.pyspark.python", sys.executable)
+        .config("spark.pyspark.driver.python", sys.executable)
         .getOrCreate()
     )
 

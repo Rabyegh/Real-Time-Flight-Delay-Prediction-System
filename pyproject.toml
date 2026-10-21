@@ -36,6 +36,7 @@ build-backend = "hatchling.build"
 
 [project.scripts]
 flight-delay-etl = "flight_delay.processing.historical_etl:main"
+flight-delay-features = "flight_delay.processing.feature_engineering:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/flight_delay"]

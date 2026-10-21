@@ -2,14 +2,16 @@
 
 A local development foundation for a flight-delay platform using US DOT Bureau of
 Transportation Statistics (BTS) history and AviationStack live flight data. The
-repository includes a validated historical CSV-to-Parquet ETL and a health-only
-API. Live ingestion, streaming transformations, feature engineering, model
-training, and prediction-serving integrations are not implemented yet.
+repository includes a validated historical CSV-to-Parquet ETL, leakage-free feature
+engineering dataset generation, and a health-only API. Live ingestion, streaming
+transformations, model training, and prediction-serving integrations are not
+implemented yet.
 
 ## Architecture
 
 ```text
-BTS monthly CSVs → PySpark historical ETL → accepted/rejected Parquet + quality report
+BTS monthly CSVs → PySpark historical ETL → accepted Parquet → PySpark feature pipeline → ML dataset + report
+                                           └─ rejected Parquet
 
 AviationStack → future ingestion → Kafka → Spark Structured Streaming
                                             ├─ MinIO (Parquet datasets)
@@ -133,6 +135,92 @@ $env:PATH = "$env:JAVA_HOME\bin;$env:HADOOP_HOME\bin;$env:PATH"
 uv run flight-delay-etl --input data\raw --output data\processed
 ```
 
+## Feature engineering and ML dataset (Phase 2)
+
+Phase 2 builds a reproducible, leakage-free machine learning dataset from the
+curated `accepted` Parquet data produced by the historical ETL.
+
+### Prediction target and prediction-time assumption
+
+- **Prediction target:** `is_delayed_15` (binary classification: `1` if departure
+  delay is $\ge 15.0$ minutes, `0` if $< 15.0$ minutes).
+- **Delay measure:** US DOT BTS `DEP_DELAY` in minutes. Measured against the
+  observed `DEP_DEL15` flag, zero discrepancies exist across all 1,059,589
+  valid rows.
+- **Prediction-time assumption:** In real-time operation, predictions are made
+  prior to flight departure (at or before scheduled departure time `CRS_DEP_TIME`).
+  Therefore, only information planned or known before gate pushback is allowable
+  as features.
+- **Handling of unobserved delay outcomes:** Flights with missing departure delay
+  labels (`DEP_DELAY IS NULL` or `DEP_DEL15 IS NULL`)—which include unobserved,
+  cancelled, or diverted flights—are excluded from training datasets with reason
+  `missing_target:DEP_DELAY`. Because cancellation indicators are absent from the
+  source files, unknown outcomes are never silently assumed to be on-time (`0`).
+
+### Feature allowlist and leakage prevention
+
+To strictly prevent target leakage, features are restricted by an explicit
+allowlist:
+
+1. **Carrier & routing:** `carrier` (`OP_UNIQUE_CARRIER`), `origin` (`ORIGIN`),
+   `dest` (`DEST`), `crs_elapsed_time` (`CRS_ELAPSED_TIME`), `distance` (`DISTANCE`).
+2. **Scheduled timing:** `crs_dep_hour`, `crs_dep_minute`, `dep_time_blk`
+   (`DEP_TIME_BLK`), `crs_arr_hour`, `crs_arr_minute`, `arr_time_blk` (`ARR_TIME_BLK`).
+   Midnight arrivals (`2400`) are mapped to hour `0`, minute `0`.
+3. **Calendar:** `month`, `day_of_month`, `day_of_week`, `is_weekend` (Saturday/Sunday).
+
+**Strictly prohibited and excluded columns:**
+- Target derivatives: `DEP_DELAY`, `DEP_DEL15`.
+- Post-departure actuals: `DEP_TIME`, `ARR_DELAY`.
+- High-cardinality text & redundant identifiers: `FL_DATE`, `YEAR`, `flight_year`,
+  `flight_month`, city/state names (`ORIGIN_CITY_NAME`, etc.).
+- Ingestion artifacts: `source_file`, `_row_fingerprint`, raw record fields.
+
+Automated tests assert that prohibited columns never enter the final dataset.
+
+### Generating the feature dataset
+
+Run the feature engineering pipeline:
+
+```powershell
+uv run flight-delay-features --input data\processed\accepted --output data\features
+```
+
+The output directory contains:
+
+```text
+data/features/
+  dataset/                    Feature Parquet dataset, partitioned by month
+  feature_quality_report.json Reconciliation, target distribution, and missing feature counts
+```
+
+### Dataset reconciliation and measured distribution
+
+On the complete February and June 2023 BTS dataset:
+
+- **Input rows:** 1,080,011
+- **Eligible rows (final count):** 1,059,588
+- **Excluded rows:** 20,423
+  - Missing departure delay target: 20,422
+  - Missing `crs_elapsed_time`: 1
+- **Target distribution:**
+  - On-time / delay < 15m (`0`): 815,913 (77.00%)
+  - Delayed $\ge 15$m (`1`): 243,675 (23.00%)
+- **Feature missing counts in final dataset:** 0 across all 15 allowlisted features.
+- **Count reconciliation:** $1,059,588 + 20,423 = 1,080,011$ (exact match).
+
+### Limitations of the dataset
+
+- **Temporal scope:** Only February and June 2023 are available. The data captures
+  winter and early-summer conditions but does not represent full-year seasonality,
+  fall/spring storms, or multi-year airline operations.
+- **Flight identification:** The source extract has no flight number or tail number,
+  preventing tail-routing or turn-around delay modeling.
+- **Cancellations:** Cancellation flags are absent from the source data, so cancellations
+  cannot be modeled as a distinct class.
+- **Phase scope:** Phase 2 focuses exclusively on dataset curation and leakage-free
+  feature engineering. Model training and offline evaluation belong to Phase 3.
+
 To use the AviationStack API in future ingestion code, sign up for an API key,
 put it in the local `.env`, and access it via `get_settings().require_aviationstack_api_key()`.
 The key is optional for the health-only API scaffold.
@@ -189,6 +277,7 @@ make lint
 make format
 make test
 make historical-etl
+make features
 make up
 make logs
 make smoke
@@ -228,7 +317,7 @@ commands directly.
 
 ## Next milestone
 
-Confirm BTS source licensing/data dictionary details and the AviationStack
-polling/refresh policy before implementing live ingestion and Kafka event
-contracts. In particular, verify the precise meaning of `DEP_DEL15` and units
-for source measures before using them as model labels or features.
+Phase 3: Model training and offline evaluation. Establish baseline classifiers
+(e.g., Logistic Regression, LightGBM/XGBoost) using the curated feature dataset,
+implement time-based train/validation splitting, log experiments to MLflow, and
+evaluate PR-AUC, ROC-AUC, and class-imbalanced metrics.

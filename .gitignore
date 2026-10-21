@@ -18,6 +18,7 @@ build/
 # Local data and model artifacts
 data/raw/
 data/processed/
+data/features/
 data/samples/
 mlruns/
 models/
