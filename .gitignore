@@ -16,9 +16,9 @@ build/
 *.egg-info/
 
 # Local data and model artifacts
-data/raw/*
-data/processed/*
-data/samples/*
+data/raw/
+data/processed/
+data/samples/
 mlruns/
 models/
 artifacts/
