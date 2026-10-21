@@ -117,6 +117,93 @@ def test_etl_parses_validates_reports_and_preserves_duplicate_rows(
     assert (output_dir / "quality_report.json").is_file()
 
 
+def test_etl_rejects_rows_with_wrong_field_counts_and_preserves_raw_values(
+    tmp_path: Path,
+    spark: SparkSession,
+) -> None:
+    input_path = tmp_path / "malformed.csv"
+    valid = _valid_record()
+    values = [valid[name] for name in SOURCE_COLUMNS]
+    extra_field = [*values, "unexpected-extra"]
+    missing_trailing_field = values[:-1]
+    with input_path.open("w", encoding="utf-8", newline="") as stream:
+        writer = csv.writer(stream)
+        writer.writerow(SOURCE_COLUMNS)
+        writer.writerows([values, extra_field, missing_trailing_field])
+
+    output_dir = tmp_path / "output"
+    report = run_historical_etl(ETLConfig(input_path=input_path, output_path=output_dir), spark)
+    accepted = spark.read.parquet(str(output_dir / "accepted"))
+    rejected = spark.read.parquet(str(output_dir / "rejected"))
+
+    assert report["input_count"] == 3
+    assert report["accepted_count"] == accepted.count() == 1
+    assert report["rejected_count"] == rejected.count() == 2
+    assert report["counts_reconcile"] is True
+    assert report["validation_results"]["malformed_record:too_few_fields"] == 1
+    assert report["validation_results"]["malformed_record:too_many_fields"] == 1
+    assert report["rejection_reason_counts"]["malformed_record:too_few_fields"] == 1
+    assert report["rejection_reason_counts"]["malformed_record:too_many_fields"] == 1
+    too_many = rejected.where("raw_field_count = 23").first()
+    too_few = rejected.where("raw_field_count = 21").first()
+    assert too_many["raw_extra_fields"] == ["unexpected-extra"]
+    assert too_many["raw_record_fields"] == extra_field
+    assert too_many["reject_reasons"] == ["malformed_record:too_many_fields"]
+    assert too_few["raw_DISTANCE"] is None
+    assert too_few["raw_record_fields"] == missing_trailing_field
+    assert "malformed_record:too_few_fields" in too_few["reject_reasons"]
+
+
+def test_etl_rejects_nonfinite_numeric_values_but_keeps_missing_values_null(
+    tmp_path: Path,
+    spark: SparkSession,
+) -> None:
+    input_path = tmp_path / "nonfinite.csv"
+    nan_delay = _valid_record()
+    nan_delay["ARR_DELAY"] = "NaN"
+    infinite_distance = _valid_record()
+    infinite_distance["DISTANCE"] = "Infinity"
+    missing_optional = _valid_record()
+    missing_optional["DEP_DELAY"] = ""
+    _write_csv(input_path, [nan_delay, infinite_distance, missing_optional])
+
+    output_dir = tmp_path / "output"
+    report = run_historical_etl(ETLConfig(input_path=input_path, output_path=output_dir), spark)
+    accepted = spark.read.parquet(str(output_dir / "accepted"))
+    rejected = spark.read.parquet(str(output_dir / "rejected"))
+
+    assert report["input_count"] == 3
+    assert report["accepted_count"] == accepted.count() == 1
+    assert report["rejected_count"] == rejected.count() == 2
+    assert report["counts_reconcile"] is True
+    assert report["validation_results"]["nonfinite_number:ARR_DELAY"] == 1
+    assert report["validation_results"]["nonfinite_number:DISTANCE"] == 1
+    assert report["rejection_reason_counts"]["nonfinite_number:ARR_DELAY"] == 1
+    assert report["rejection_reason_counts"]["nonfinite_number:DISTANCE"] == 1
+    assert accepted.select("DEP_DELAY").first()["DEP_DELAY"] is None
+    assert rejected.where("raw_ARR_DELAY = 'NaN'").count() == 1
+    assert rejected.where("raw_DISTANCE = 'Infinity'").count() == 1
+
+
+def test_duplicate_reporting_uses_untrimmed_raw_field_values(
+    tmp_path: Path,
+    spark: SparkSession,
+) -> None:
+    input_path = tmp_path / "duplicates.csv"
+    exact = _valid_record()
+    whitespace_variant = _valid_record()
+    whitespace_variant["ORIGIN"] = " AAA "
+    _write_csv(input_path, [exact, exact, whitespace_variant])
+
+    output_dir = tmp_path / "output"
+    report = run_historical_etl(ETLConfig(input_path=input_path, output_path=output_dir), spark)
+    accepted = spark.read.parquet(str(output_dir / "accepted"))
+
+    assert report["input_count"] == report["accepted_count"] == accepted.count() == 3
+    assert report["duplicate_count"] == 1
+    assert report["counts_reconcile"] is True
+
+
 def test_schema_mismatch_is_reported_without_overwriting_existing_output(
     tmp_path: Path,
     spark: SparkSession,

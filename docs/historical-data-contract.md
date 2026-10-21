@@ -77,6 +77,9 @@ that it uniquely identifies a flight.
 
 1. Read CSV using UTF-8 with BOM support and header-based parsing; do not infer
    schema from file order alone.
+   Reject any data record whose parsed field count differs from the 22-column
+   header. Preserve its available source values and any extra trailing fields
+   in the rejected dataset with a too-few/too-many-fields reason.
 2. Normalize header names only by removing a leading BOM, trimming surrounding
    whitespace, and converting to uppercase. Reject duplicate names created by
    normalization and report missing, unexpected, or incompatible fields.
@@ -84,15 +87,17 @@ that it uniquely identifies a flight.
    explicit issue, not a reason to silently discard or coerce columns.
 4. Parse `FL_DATE` with the observed month/day/year and 12-hour-time format,
    then validate it against the integer date components.
-5. Parse numeric fields explicitly. Blank or malformed optional measurements
-   remain null or are rejected with a recorded field-specific reason; unknown
-   delays are never converted to zero.
+5. Parse numeric fields explicitly. Blank optional measurements remain null;
+   malformed and non-finite numeric values (including NaN and Infinity) are
+   rejected with a recorded field-specific reason. Unknown delays are never
+   converted to zero.
 6. Validate date components, weekday, clock encodings (including observed
    `2400`), binary `DEP_DEL15`, and positive non-null elapsed time/distance.
    Do not reject long delay values solely for being unusually large.
 7. There is no defensible flight-level deduplication key in these extracts.
-   Preserve rows, report exact duplicate candidates, and do not silently
-   drop records based on the proposed composite tuple.
+   Report rows whose parsed source field values match exactly (without trimming
+   field values), and do not drop records based on that metric or the proposed
+   composite tuple.
 
 The raw files are local inputs and are excluded by `.gitignore`; neither these
 files nor generated Parquet outputs belong in Git.

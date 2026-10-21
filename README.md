@@ -88,10 +88,13 @@ and positive non-null `CRS_ELAPSED_TIME`/`DISTANCE`.
 Required fields are `FL_DATE`, `YEAR`, `MONTH`, `DAY_OF_MONTH`, `DAY_OF_WEEK`,
 `OP_UNIQUE_CARRIER`, `ORIGIN`, `DEST`, and `CRS_DEP_TIME`. Missing optional
 measurements remain null. Malformed values and invalid records are written to
-the rejected dataset with raw values and rejection reasons; delay values are
-not imputed or capped. There is no flight number or reliable unique key in
-these files, so duplicate candidates are reported but records are not silently
-deduplicated.
+the rejected dataset with raw values and rejection reasons. Rows with fewer or
+more than 22 CSV fields are rejected, with extra fields preserved in
+`raw_record_fields` and `raw_extra_fields`. Non-finite numeric values such as
+NaN and Infinity are rejected; delay values are not imputed or capped. There
+is no flight number or reliable unique key in these files, so exact parsed
+field-value duplicates are reported without trimming values, and records are
+never silently deduplicated.
 
 Run both input files, or choose one file explicitly:
 

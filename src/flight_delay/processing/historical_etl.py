@@ -19,7 +19,7 @@ from typing import Any
 from pyspark import StorageLevel
 from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
-from pyspark.sql.types import StringType, StructField, StructType
+from pyspark.sql.types import ArrayType, IntegerType, StringType, StructField, StructType
 
 LOGGER = logging.getLogger(__name__)
 
@@ -145,26 +145,110 @@ def _new_spark_session(master: str) -> SparkSession:
     )
 
 
+def _stage_csv_records(
+    paths: list[Path],
+    headers: dict[Path, list[str]],
+    staging_path: Path,
+) -> tuple[dict[Path, Path], list[Path]]:
+    valid_paths: dict[Path, Path] = {}
+    malformed_paths: list[Path] = []
+    staging_path.mkdir(parents=True, exist_ok=True)
+
+    for index, path in enumerate(paths):
+        valid_path = staging_path / f"{index}-{path.name}"
+        malformed_path = staging_path / f"{index}-{path.stem}-malformed.jsonl"
+        positions = [headers[path].index(name) for name in SOURCE_COLUMNS]
+        malformed_count = 0
+        try:
+            with (
+                path.open("r", encoding="utf-8-sig", newline="") as source,
+                valid_path.open("w", encoding="utf-8", newline="") as valid_stream,
+                malformed_path.open("w", encoding="utf-8", newline="") as malformed_stream,
+            ):
+                reader = csv.reader(source, delimiter=",")
+                next(reader)
+                valid_writer = csv.writer(valid_stream)
+                valid_writer.writerow(SOURCE_COLUMNS)
+                for record in reader:
+                    field_count = len(record)
+                    if field_count == len(SOURCE_COLUMNS):
+                        valid_writer.writerow([record[position] for position in positions])
+                        continue
+
+                    malformed_count += 1
+                    malformed_record = {
+                        name: record[position] if position < field_count else None
+                        for name, position in zip(SOURCE_COLUMNS, positions, strict=True)
+                    }
+                    malformed_record.update(
+                        {
+                            "source_file": path.name,
+                            "_raw_field_count": field_count,
+                            "_raw_extra_fields": record[len(SOURCE_COLUMNS) :],
+                            "_raw_record_fields": record,
+                        }
+                    )
+                    malformed_stream.write(json.dumps(malformed_record, ensure_ascii=False) + "\n")
+        except StopIteration:
+            raise HistoricalETLError(f"CSV file is empty: {path}") from None
+        except (OSError, UnicodeError, csv.Error) as error:
+            raise HistoricalETLError(f"Could not stage CSV records from {path}: {error}") from error
+
+        valid_paths[path] = valid_path
+        if malformed_count:
+            malformed_paths.append(malformed_path)
+        else:
+            malformed_path.unlink()
+
+    return valid_paths, malformed_paths
+
+
 def _read_csv_files(
     spark: SparkSession,
     paths: list[Path],
-    headers: dict[Path, list[str]],
+    valid_paths: dict[Path, Path],
+    malformed_paths: list[Path],
 ) -> DataFrame:
     frames: list[DataFrame] = []
     for path in paths:
-        header = headers[path]
-        schema = StructType([StructField(name, StringType(), True) for name in header])
+        schema = StructType([StructField(name, StringType(), True) for name in SOURCE_COLUMNS])
         frame = (
             spark.read.schema(schema)
             .option("header", "true")
             .option("enforceSchema", "true")
             .option("encoding", "UTF-8")
             .option("mode", "PERMISSIVE")
-            .csv(str(path))
+            .csv(str(valid_paths[path]))
             .select(*[F.col(name) for name in SOURCE_COLUMNS])
             .withColumn("source_file", F.lit(path.name))
+            .withColumn("_raw_field_count", F.lit(len(SOURCE_COLUMNS)))
+            .withColumn("_raw_extra_fields", F.array().cast("array<string>"))
+            .withColumn("_raw_record_fields", F.lit(None).cast("array<string>"))
         )
         frames.append(frame)
+
+    if malformed_paths:
+        malformed_schema = StructType(
+            [
+                *[StructField(name, StringType(), True) for name in SOURCE_COLUMNS],
+                StructField("source_file", StringType(), False),
+                StructField("_raw_field_count", IntegerType(), True),
+                StructField(
+                    "_raw_extra_fields",
+                    ArrayType(StringType(), containsNull=True),
+                    True,
+                ),
+                StructField(
+                    "_raw_record_fields",
+                    ArrayType(StringType(), containsNull=True),
+                    True,
+                ),
+            ]
+        )
+        malformed = spark.read.schema(malformed_schema).json(
+            [str(path) for path in malformed_paths]
+        )
+        frames.append(malformed)
 
     combined = frames[0]
     for frame in frames[1:]:
@@ -189,6 +273,9 @@ def _prepare_rows(raw: DataFrame) -> tuple[DataFrame, list[tuple[str, F.Column]]
     frame = raw.select(
         *[F.col(name).alias(original_names[name]) for name in SOURCE_COLUMNS],
         F.col("source_file"),
+        F.col("_raw_field_count"),
+        F.col("_raw_extra_fields"),
+        F.col("_raw_record_fields"),
     )
 
     for name in SOURCE_COLUMNS:
@@ -234,6 +321,27 @@ def _prepare_rows(raw: DataFrame) -> tuple[DataFrame, list[tuple[str, F.Column]]
                 (F.length(F.trim(raw_value)) > 0) & F.col(name).isNull(),
             )
         )
+        numeric_value = _cast_column(original_names[name], "DOUBLE")
+        conditions.append(
+            (
+                f"nonfinite_number:{name}",
+                (F.length(F.trim(raw_value)) > 0)
+                & (F.isnan(numeric_value) | (F.abs(numeric_value) == F.lit(float("inf")))),
+            )
+        )
+
+    conditions.extend(
+        [
+            (
+                "malformed_record:too_few_fields",
+                F.col("_raw_field_count") < len(SOURCE_COLUMNS),
+            ),
+            (
+                "malformed_record:too_many_fields",
+                F.col("_raw_field_count") > len(SOURCE_COLUMNS),
+            ),
+        ]
+    )
 
     flag_raw = F.col(original_names["DEP_DEL15"])
     flag_number = _cast_column(original_names["DEP_DEL15"], "DOUBLE")
@@ -299,7 +407,7 @@ def _prepare_rows(raw: DataFrame) -> tuple[DataFrame, list[tuple[str, F.Column]]
     ).drop(*[f"reason_{index}" for index in range(len(reason_columns))])
 
     duplicate_json = F.to_json(
-        F.struct(*[F.trim(F.col(original_names[name])).alias(name) for name in SOURCE_COLUMNS]),
+        F.struct(*[F.col(original_names[name]).alias(name) for name in SOURCE_COLUMNS]),
         {"ignoreNullFields": "false"},
     )
     frame = (
@@ -380,6 +488,9 @@ def _write_and_promote(
             *SOURCE_COLUMNS,
             *[F.col(f"__raw__{name}").alias(f"raw_{name}") for name in SOURCE_COLUMNS],
             "source_file",
+            F.col("_raw_field_count").alias("raw_field_count"),
+            F.col("_raw_extra_fields").alias("raw_extra_fields"),
+            F.col("_raw_record_fields").alias("raw_record_fields"),
             "reject_reasons",
             "flight_year",
             "flight_month",
@@ -496,42 +607,48 @@ def run_historical_etl(
     owns_spark = spark is None
     session = spark or _new_spark_session(config.spark_master)
     try:
-        raw = _read_csv_files(session, paths, headers)
-        frame, conditions = _prepare_rows(raw)
-        frame.persist(StorageLevel.DISK_ONLY)
-        try:
-            report, duplicate_count, reason_counts = _summarize(frame, conditions)
-            report.update(
-                {
-                    "status": "completed",
-                    "input_files": [path.name for path in paths],
-                    "duplicate_count": duplicate_count,
-                    "duplicate_policy": (
-                        "Exact full-row repeats are reported but retained; the source "
-                        "has no reliable flight identifier."
-                    ),
-                    "rejection_reason_counts": reason_counts,
-                    "schema_issues": [],
-                    "outputs": {
-                        "accepted_parquet": str(config.output_path / "accepted"),
-                        "rejected_parquet": str(config.output_path / "rejected"),
-                        "quality_report": str(config.output_path / "quality_report.json"),
-                    },
-                    "counts_reconcile": report["input_count"]
-                    == report["accepted_count"] + report["rejected_count"],
-                }
+        with tempfile.TemporaryDirectory(prefix="flight-delay-input-") as staging_dir:
+            valid_paths, malformed_paths = _stage_csv_records(
+                paths,
+                headers,
+                Path(staging_dir),
             )
-            LOGGER.info(
-                "ETL counts: input=%d accepted=%d rejected=%d exact-duplicate-candidates=%d",
-                report["input_count"],
-                report["accepted_count"],
-                report["rejected_count"],
-                duplicate_count,
-            )
-            _write_and_promote(frame, report, config.output_path)
-            return report
-        finally:
-            frame.unpersist()
+            raw = _read_csv_files(session, paths, valid_paths, malformed_paths)
+            frame, conditions = _prepare_rows(raw)
+            frame.persist(StorageLevel.DISK_ONLY)
+            try:
+                report, duplicate_count, reason_counts = _summarize(frame, conditions)
+                report.update(
+                    {
+                        "status": "completed",
+                        "input_files": [path.name for path in paths],
+                        "duplicate_count": duplicate_count,
+                        "duplicate_policy": (
+                            "Exact full-row field-value repeats are reported but retained; "
+                            "the source has no reliable flight identifier."
+                        ),
+                        "rejection_reason_counts": reason_counts,
+                        "schema_issues": [],
+                        "outputs": {
+                            "accepted_parquet": str(config.output_path / "accepted"),
+                            "rejected_parquet": str(config.output_path / "rejected"),
+                            "quality_report": str(config.output_path / "quality_report.json"),
+                        },
+                        "counts_reconcile": report["input_count"]
+                        == report["accepted_count"] + report["rejected_count"],
+                    }
+                )
+                LOGGER.info(
+                    "ETL counts: input=%d accepted=%d rejected=%d exact-duplicate-candidates=%d",
+                    report["input_count"],
+                    report["accepted_count"],
+                    report["rejected_count"],
+                    duplicate_count,
+                )
+                _write_and_promote(frame, report, config.output_path)
+                return report
+            finally:
+                frame.unpersist()
     finally:
         if owns_spark:
             session.stop()
