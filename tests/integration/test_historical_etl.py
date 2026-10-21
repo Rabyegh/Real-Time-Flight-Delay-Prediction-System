@@ -125,30 +125,48 @@ def test_etl_rejects_rows_with_wrong_field_counts_and_preserves_raw_values(
     valid = _valid_record()
     values = [valid[name] for name in SOURCE_COLUMNS]
     extra_field = [*values, "unexpected-extra"]
+    different_extra_field = [*values, "different-extra"]
     missing_trailing_field = values[:-1]
     with input_path.open("w", encoding="utf-8", newline="") as stream:
         writer = csv.writer(stream)
         writer.writerow(SOURCE_COLUMNS)
-        writer.writerows([values, extra_field, missing_trailing_field])
+        writer.writerows(
+            [
+                values,
+                extra_field,
+                different_extra_field,
+                missing_trailing_field,
+                missing_trailing_field,
+            ]
+        )
 
     output_dir = tmp_path / "output"
     report = run_historical_etl(ETLConfig(input_path=input_path, output_path=output_dir), spark)
     accepted = spark.read.parquet(str(output_dir / "accepted"))
     rejected = spark.read.parquet(str(output_dir / "rejected"))
 
-    assert report["input_count"] == 3
+    assert report["input_count"] == 5
     assert report["accepted_count"] == accepted.count() == 1
-    assert report["rejected_count"] == rejected.count() == 2
+    assert report["rejected_count"] == rejected.count() == 4
+    assert report["duplicate_count"] == 1
     assert report["counts_reconcile"] is True
-    assert report["validation_results"]["malformed_record:too_few_fields"] == 1
-    assert report["validation_results"]["malformed_record:too_many_fields"] == 1
-    assert report["rejection_reason_counts"]["malformed_record:too_few_fields"] == 1
-    assert report["rejection_reason_counts"]["malformed_record:too_many_fields"] == 1
-    too_many = rejected.where("raw_field_count = 23").first()
+    assert report["validation_results"]["malformed_record:too_few_fields"] == 2
+    assert report["validation_results"]["malformed_record:too_many_fields"] == 2
+    assert report["rejection_reason_counts"]["malformed_record:too_few_fields"] == 2
+    assert report["rejection_reason_counts"]["malformed_record:too_many_fields"] == 2
+    too_many_rows = rejected.where("raw_field_count = 23").collect()
     too_few = rejected.where("raw_field_count = 21").first()
-    assert too_many["raw_extra_fields"] == ["unexpected-extra"]
-    assert too_many["raw_record_fields"] == extra_field
-    assert too_many["reject_reasons"] == ["malformed_record:too_many_fields"]
+    assert {tuple(row["raw_extra_fields"]) for row in too_many_rows} == {
+        ("unexpected-extra",),
+        ("different-extra",),
+    }
+    assert {tuple(row["raw_record_fields"]) for row in too_many_rows} == {
+        tuple(extra_field),
+        tuple(different_extra_field),
+    }
+    assert all(
+        row["reject_reasons"] == ["malformed_record:too_many_fields"] for row in too_many_rows
+    )
     assert too_few["raw_DISTANCE"] is None
     assert too_few["raw_record_fields"] == missing_trailing_field
     assert "malformed_record:too_few_fields" in too_few["reject_reasons"]

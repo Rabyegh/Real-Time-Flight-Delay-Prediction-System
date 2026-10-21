@@ -223,7 +223,7 @@ def _read_csv_files(
             .withColumn("source_file", F.lit(path.name))
             .withColumn("_raw_field_count", F.lit(len(SOURCE_COLUMNS)))
             .withColumn("_raw_extra_fields", F.array().cast("array<string>"))
-            .withColumn("_raw_record_fields", F.lit(None).cast("array<string>"))
+            .withColumn("_raw_record_fields", F.array(*[F.col(name) for name in SOURCE_COLUMNS]))
         )
         frames.append(frame)
 
@@ -407,7 +407,10 @@ def _prepare_rows(raw: DataFrame) -> tuple[DataFrame, list[tuple[str, F.Column]]
     ).drop(*[f"reason_{index}" for index in range(len(reason_columns))])
 
     duplicate_json = F.to_json(
-        F.struct(*[F.col(original_names[name]).alias(name) for name in SOURCE_COLUMNS]),
+        F.struct(
+            F.col("_raw_field_count"),
+            F.col("_raw_record_fields"),
+        ),
         {"ignoreNullFields": "false"},
     )
     frame = (
