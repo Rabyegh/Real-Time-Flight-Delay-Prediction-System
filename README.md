@@ -255,19 +255,119 @@ make the entire platform infallible or replace runtime retry handling.
 src/flight_delay/       Application package and separated domain packages
   config/               Pydantic settings and environment loading
   ingestion/            Future BTS and AviationStack ingestion
-  processing/           Historical CSV ETL; future streaming and features
+  processing/           Historical CSV ETL and leakage-free feature engineering
   storage/              Future Cassandra and dataset persistence
-  training/             Future classifier/regressor training and evaluation
+  training/             Baseline classifier training, evaluation, and artifact generation
   api/                  FastAPI application
-tests/unit/             Configuration and API tests
-tests/integration/      Synthetic Spark ETL and Parquet tests
+tests/unit/             Unit tests (settings, health, feature engineering, baseline training)
+tests/integration/      Integration tests (PySpark ETL, feature pipeline, baseline pipeline)
 scripts/                Local infrastructure smoke checks
 configs/                Prometheus configuration
 docker/                 API image and Grafana provisioning
-data/                   Local-only data (subdirectories created as needed)
+data/                   Local-only data (raw, processed, features, samples, models)
+models/                 Git-ignored model artifacts (models/baseline/)
 notebooks/              Exploratory analysis (future)
 dags/                   Airflow workflows (future)
 ```
+
+## Baseline Model Training and Evaluation (Phase 3)
+
+The baseline model training pipeline establishes reproducible, leakage-free reference
+benchmarks on the curated historical feature dataset (`data/features/dataset`).
+
+### Prediction Target & Horizon
+
+- **Target:** `is_delayed_15` (binary classification: `1` if `DEP_DELAY >= 15.0` minutes, `0` otherwise).
+- **Prediction Horizon:** Planned pre-departure time. The model uses only features known before
+  the flight departs. All post-departure actual timestamps (`DEP_TIME`, `ARR_TIME`), delays
+  (`DEP_DELAY`, `ARR_DELAY`), and metadata are strictly excluded.
+
+### Feature Allowlist
+
+15 pre-departure features:
+- **Categoricals (5):** `carrier`, `origin`, `dest`, `dep_time_blk`, `arr_time_blk` (one-hot encoded,
+  handling unknown categories safely).
+- **Numericals (10):** `crs_dep_hour`, `crs_dep_minute`, `crs_arr_hour`, `crs_arr_minute`, `month`,
+  `day_of_month`, `day_of_week`, `is_weekend`, `crs_elapsed_time`, `distance` (standard scaled).
+
+### Chronological Data Split Strategy
+
+Because the available BTS data covers only February and June 2023 (with a 3-month gap between them),
+a strict chronological boundary split is used to evaluate future flights from past data while
+preventing day-of-week distortion:
+
+| Subset | Date Range | Row Count | Delay Rate | Rationale |
+|---|---|---|---|---|
+| **Train** | `2023-02-01` to `2023-06-16` | 798,992 (75.4%) | 20.58% | All February (winter) + June 1-16 (early summer) |
+| **Validation** | `2023-06-17` to `2023-06-23` | 132,728 (12.5%) | 28.56% | Exactly 1 full 7-day cycle (Sat to Fri) in mid-June |
+| **Test** | `2023-06-24` to `2023-06-30` | 127,868 (12.1%) | 32.30% | Exactly 1 full 7-day cycle (Sat to Fri) in late June |
+
+- **Date Disjointness:** Strictly enforced. No calendar date appears in multiple subsets.
+- **Leakage Prevention:** All preprocessing transformers (`OneHotEncoder`, `StandardScaler`) are
+  fitted exclusively on `X_train`. The test set remains completely isolated until final evaluation.
+- **Validation Role:** The validation partition (`2023-06-17` to `2023-06-23`) provides an
+  intermediate temporal benchmark to monitor seasonal progression. It is reported for comparison
+  and reserved for future hyperparameter sweeps and threshold tuning; no tuning was applied in this baseline phase.
+
+### Evaluation Results Across Partitions
+
+| Metric | Majority Baseline (Test) | Logistic Regression (Validation) | Logistic Regression (Test) | Test vs Baseline Delta |
+|---|---|---|---|---|
+| **Accuracy** | 67.70% | 73.41% | 69.10% | +1.40% |
+| **Precision** | 0.00% | 61.09% | 54.05% | +54.05% |
+| **Recall** | 0.00% | 19.01% | 28.89% | +28.89% |
+| **F1-Score** | 0.0000 | 0.2900 | 0.3766 | +0.3766 |
+| **ROC-AUC** | 0.5000 | 0.7158 | 0.6840 | +0.1840 |
+| **PR-AUC (Avg Precision)** | 0.3230 | 0.4941 | 0.4888 | +0.1658 |
+| **Prevalence** | 32.30% | 28.56% | 32.30% | — |
+
+**Confusion Matrix (Held-Out Test Set, Late June, N = 127,868):**
+- True Negatives: 76,417 | False Positives: 10,146
+- False Negatives: 29,371 | True Positives: 11,934
+
+**Confusion Matrix (Validation Set, Mid-June, N = 132,728):**
+- True Negatives: 90,226 | False Positives: 4,591
+- False Negatives: 30,703 | True Positives: 7,208
+
+### Why Accuracy Alone Is Insufficient
+
+In an imbalanced setting (32.3% delay rate in late June):
+- The naive majority baseline scores **67.7% accuracy** simply by predicting that every single flight
+  is on-time. Its precision, recall, and F1 are **0.0000**, and its ROC-AUC is **0.5000** (random).
+- Measuring accuracy alone rewards a model that fails to detect any delays.
+- Logistic Regression achieves an ROC-AUC of **0.6840** and PR-AUC of **0.4888** (significantly above
+  the 0.3230 baseline), correctly catching 11,934 delayed flights with 54.05% precision.
+
+### How to Run Baseline Training
+
+```powershell
+# Using Makefile
+make train
+
+# Or via CLI
+uv run flight-delay-train --input data/features/dataset --output models/baseline
+```
+
+Generated artifacts (stored under Git-ignored `models/baseline/`):
+- `model.joblib`: Serialized scikit-learn Logistic Regression pipeline.
+- `dummy_model.joblib`: Serialized majority-class baseline.
+- `evaluation_metrics.json`: Full machine-readable metrics across train, val, and test.
+- `split_metadata.json`: Date ranges, sample counts, and class distributions.
+- `evaluation_report.md`: Structured evaluation report with markdown tables.
+
+### Limitations & Non-Production Notice
+
+> [!WARNING]
+> This model is a **baseline reference benchmark** and is **NOT production-ready**.
+
+1. **Non-Consecutive Coverage:** Only February and June 2023 data are available, leaving March,
+   April, and May unobserved.
+2. **Seasonal Drift:** Summer travel congestion drives delay rates from 18.5% in February to
+   32.3% in late June. A model trained primarily on winter data faces significant concept drift.
+3. **No Generalization Guarantee:** Results from two months in 2023 do not establish generalization
+   to autumn, holiday peaks, other operating years, or airlines not represented in the sample.
+4. **Pre-Departure Horizon:** Static schedule features alone cannot capture real-time weather
+   disruptions, gate holds, or upstream aircraft turnaround delays.
 
 ## Useful commands
 
@@ -278,6 +378,7 @@ make format
 make test
 make historical-etl
 make features
+make train
 make up
 make logs
 make smoke
@@ -317,7 +418,5 @@ commands directly.
 
 ## Next milestone
 
-Phase 3: Model training and offline evaluation. Establish baseline classifiers
-(e.g., Logistic Regression, LightGBM/XGBoost) using the curated feature dataset,
-implement time-based train/validation splitting, log experiments to MLflow, and
-evaluate PR-AUC, ROC-AUC, and class-imbalanced metrics.
+Phase 4: Real-time streaming infrastructure and feature serving (Kafka producers/consumers,
+Spark Structured Streaming, Cassandra feature store state, and real-time inference).

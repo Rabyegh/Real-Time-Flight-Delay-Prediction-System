@@ -2,8 +2,10 @@ ETL_INPUT ?= data/raw
 ETL_OUTPUT ?= data/processed
 FEATURES_INPUT ?= data/processed/accepted
 FEATURES_OUTPUT ?= data/features
+TRAIN_INPUT ?= data/features/dataset
+TRAIN_OUTPUT ?= models/baseline
 
-.PHONY: install lint format test historical-etl features up down logs smoke
+.PHONY: install lint format test historical-etl features train up down logs smoke
 
 install:
 	uv sync --group dev
@@ -24,6 +26,9 @@ historical-etl:
 
 features:
 	uv run flight-delay-features --input "$(FEATURES_INPUT)" --output "$(FEATURES_OUTPUT)"
+
+train:
+	uv run flight-delay-train --input "$(TRAIN_INPUT)" --output "$(TRAIN_OUTPUT)"
 
 up:
 	docker compose up --build -d
