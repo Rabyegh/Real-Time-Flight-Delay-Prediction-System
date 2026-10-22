@@ -10,6 +10,7 @@ from flight_delay.processing.feature_engineering import (
     TargetLeakageError,
     assert_no_leakage,
     build_feature_dataset,
+    validate_dataset_paths,
 )
 
 __all__ = [
@@ -22,4 +23,5 @@ __all__ = [
     "TargetLeakageError",
     "assert_no_leakage",
     "build_feature_dataset",
+    "validate_dataset_paths",
 ]

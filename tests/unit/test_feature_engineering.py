@@ -1,5 +1,7 @@
 """Unit tests for Phase 2 feature engineering and leakage prevention."""
 
+from pathlib import Path
+
 import pytest
 
 from flight_delay.processing.feature_engineering import (
@@ -7,8 +9,10 @@ from flight_delay.processing.feature_engineering import (
     FEATURE_ALLOWLIST,
     PROHIBITED_COLUMNS,
     TARGET_COLUMN,
+    FeatureEngineeringError,
     TargetLeakageError,
     assert_no_leakage,
+    validate_dataset_paths,
 )
 
 
@@ -52,3 +56,47 @@ def test_assert_no_leakage_rejects_outcome_pattern_variants() -> None:
 
 def test_target_delay_threshold_is_exactly_15_minutes() -> None:
     assert DELAY_THRESHOLD_MINUTES == 15.0
+
+
+def test_validate_dataset_paths_accepts_valid_separate_paths(tmp_path: Path) -> None:
+    input_path = tmp_path / "data" / "processed" / "accepted"
+    input_path.mkdir(parents=True)
+    output_path = tmp_path / "data" / "features"
+
+    in_res, out_res = validate_dataset_paths(input_path, output_path)
+    assert in_res == input_path.resolve()
+    assert out_res == output_path.resolve()
+
+
+def test_validate_dataset_paths_rejects_identical_paths(tmp_path: Path) -> None:
+    path = tmp_path / "data" / "processed" / "accepted"
+    path.mkdir(parents=True)
+
+    with pytest.raises(FeatureEngineeringError, match="Output path cannot be identical"):
+        validate_dataset_paths(path, path)
+
+
+def test_validate_dataset_paths_rejects_output_nested_inside_input(tmp_path: Path) -> None:
+    input_path = tmp_path / "data" / "processed" / "accepted"
+    input_path.mkdir(parents=True)
+    nested_output = input_path / "features"
+
+    with pytest.raises(FeatureEngineeringError, match="Output path cannot be inside"):
+        validate_dataset_paths(input_path, nested_output)
+
+
+def test_validate_dataset_paths_rejects_output_parent_of_input(tmp_path: Path) -> None:
+    parent_dir = tmp_path / "data"
+    input_path = parent_dir / "processed" / "accepted"
+    input_path.mkdir(parents=True)
+
+    with pytest.raises(FeatureEngineeringError, match="Output path cannot contain"):
+        validate_dataset_paths(input_path, parent_dir)
+
+
+def test_validate_dataset_paths_rejects_nonexistent_input(tmp_path: Path) -> None:
+    input_path = tmp_path / "nonexistent"
+    output_path = tmp_path / "features"
+
+    with pytest.raises(FeatureEngineeringError, match="Input path does not exist"):
+        validate_dataset_paths(input_path, output_path)

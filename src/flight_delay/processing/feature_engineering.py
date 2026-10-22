@@ -68,6 +68,32 @@ class TargetLeakageError(FeatureEngineeringError):
     """Raised when target leakage is detected in the model feature set."""
 
 
+def validate_dataset_paths(input_path: Path | str, output_path: Path | str) -> tuple[Path, Path]:
+    """Validate that input exists and output does not collide with or reside inside input."""
+    in_path = Path(input_path)
+    out_path = Path(output_path)
+    if not in_path.exists():
+        raise FeatureEngineeringError(f"Input path does not exist: {input_path}")
+
+    input_resolved = in_path.resolve()
+    output_resolved = out_path.resolve()
+
+    if input_resolved == output_resolved:
+        raise FeatureEngineeringError(
+            f"Output path cannot be identical to input path: {output_path}"
+        )
+    if input_resolved in output_resolved.parents:
+        raise FeatureEngineeringError(
+            f"Output path cannot be inside input dataset directory: {output_path}"
+        )
+    if output_resolved in input_resolved.parents:
+        raise FeatureEngineeringError(
+            f"Output path cannot contain input dataset directory: {output_path}"
+        )
+
+    return input_resolved, output_resolved
+
+
 @dataclass(frozen=True)
 class FeatureConfig:
     """Configuration for building the model feature dataset."""
@@ -155,11 +181,15 @@ def _build_conditions(frame: DataFrame) -> list[tuple[str, F.Column]]:
     # Clock validity (CRS_DEP_TIME and CRS_ARR_TIME)
     for name in ("CRS_DEP_TIME", "CRS_ARR_TIME"):
         col = F.col(name)
-        conditions.append(
-            (
-                f"invalid_clock:{name}",
-                col.isNull() | (col < 0) | (col > 2400) | (F.pmod(col, F.lit(100)) >= 60),
-            )
+        feature_name = name.lower()
+        conditions.extend(
+            [
+                (f"missing_feature:{feature_name}", col.isNull()),
+                (
+                    f"invalid_clock:{name}",
+                    col.isNotNull() & ((col < 0) | (col > 2400) | (F.pmod(col, F.lit(100)) >= 60)),
+                ),
+            ]
         )
 
     # Calendar domain checks
@@ -379,15 +409,7 @@ def build_feature_dataset(
 ) -> dict[str, Any]:
     """Build a leakage-free ML dataset from curated accepted Parquet."""
     config = config or FeatureConfig()
-    if not config.input_path.exists():
-        raise FeatureEngineeringError(f"Input path does not exist: {config.input_path}")
-
-    input_resolved = config.input_path.resolve()
-    output_resolved = config.output_path.resolve()
-    if input_resolved == output_resolved or output_resolved in input_resolved.parents:
-        raise FeatureEngineeringError(
-            f"Output path cannot be identical to or contain the input path: {config.output_path}"
-        )
+    validate_dataset_paths(config.input_path, config.output_path)
 
     owns_spark = spark is None
     session = spark or _new_spark_session(config.spark_master)

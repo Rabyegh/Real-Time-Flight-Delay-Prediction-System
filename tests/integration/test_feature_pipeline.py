@@ -68,8 +68,8 @@ def _row(
     dep_delay: float | None = -3.0,
     dep_del15: int | None = 0,
     day_of_week: int = 3,
-    crs_dep_time: int = 741,
-    crs_arr_time: int = 844,
+    crs_dep_time: int | None = 741,
+    crs_arr_time: int | None = 844,
     crs_elapsed_time: float | None = 63.0,
     distance: float | None = 145.0,
     month: int = 2,
@@ -121,12 +121,22 @@ def test_feature_pipeline_target_classification_and_reconciliation(
         _row(dep_delay=45.0, dep_del15=1, day_of_week=6, crs_dep_time=1200),
         # 5. Midnight arrival: crs_arr_time=2400 -> hour 0, minute 0
         _row(dep_delay=0.0, dep_del15=0, day_of_week=7, crs_arr_time=2400),
-        # 6. Missing delay outcome (cancelled/diverted/unobserved) -> excluded
+        # 6. Midnight departure: crs_dep_time=0 -> hour 0, minute 0, accepted as midnight
+        _row(dep_delay=-2.0, dep_del15=0, day_of_week=2, crs_dep_time=0),
+        # 7. Missing delay outcome (cancelled/diverted/unobserved) -> excluded
         _row(dep_delay=None, dep_del15=None),
-        # 7. Missing required feature: crs_elapsed_time is None -> excluded
+        # 8. Missing required feature: crs_elapsed_time is None -> excluded
         _row(dep_delay=10.0, dep_del15=0, crs_elapsed_time=None),
-        # 8. Nonpositive feature: distance = 0.0 -> excluded
+        # 9. Nonpositive feature: distance = 0.0 -> excluded
         _row(dep_delay=10.0, dep_del15=0, distance=0.0),
+        # 10. Invalid clock departure: 1260 -> excluded invalid_clock:CRS_DEP_TIME
+        _row(dep_delay=5.0, dep_del15=0, crs_dep_time=1260),
+        # 11. Missing scheduled departure clock -> excluded missing_feature:crs_dep_time
+        _row(dep_delay=5.0, dep_del15=0, crs_dep_time=None),
+        # 12. Missing scheduled arrival clock -> excluded missing_feature:crs_arr_time
+        _row(dep_delay=5.0, dep_del15=0, crs_arr_time=None),
+        # 13. Invalid clock arrival: 2460 -> excluded invalid_clock:CRS_ARR_TIME
+        _row(dep_delay=5.0, dep_del15=0, crs_arr_time=2460),
     ]
 
     df = spark.createDataFrame(records, schema=ACCEPTED_SCHEMA)
@@ -138,27 +148,31 @@ def test_feature_pipeline_target_classification_and_reconciliation(
     )
 
     # Reconciliation
-    assert report["input_rows"] == 8
-    assert report["eligible_rows"] == 5
-    assert report["excluded_rows"] == 3
+    assert report["input_rows"] == 13
+    assert report["eligible_rows"] == 6
+    assert report["excluded_rows"] == 7
     assert report["counts_reconcile"] is True
-    assert report["final_row_count"] == 5
+    assert report["final_row_count"] == 6
 
     # Exclusion breakdown
     assert report["exclusion_reasons"]["missing_target:DEP_DELAY"] == 1
     assert report["exclusion_reasons"]["missing_feature:crs_elapsed_time"] == 1
     assert report["exclusion_reasons"]["nonpositive_feature:distance"] == 1
+    assert report["exclusion_reasons"]["invalid_clock:CRS_DEP_TIME"] == 1
+    assert report["exclusion_reasons"]["missing_feature:crs_dep_time"] == 1
+    assert report["exclusion_reasons"]["missing_feature:crs_arr_time"] == 1
+    assert report["exclusion_reasons"]["invalid_clock:CRS_ARR_TIME"] == 1
 
-    # Target distribution: 2 delayed (15.0, 45.0) and 3 on-time (-3.0, 14.0, 0.0)
+    # Target distribution: 2 delayed (15.0, 45.0) and 4 on-time (-3.0, 14.0, 0.0, -2.0)
     assert report["target_distribution"]["positive_count (delay >= 15m)"] == 2
-    assert report["target_distribution"]["negative_count (delay < 15m)"] == 3
-    assert report["target_distribution"]["positive_rate"] == 0.4
+    assert report["target_distribution"]["negative_count (delay < 15m)"] == 4
+    assert report["target_distribution"]["positive_rate"] == 0.333333
 
     # Parquet dataset verification
     dataset_path = output_dir / "dataset"
     assert dataset_path.exists()
     feature_df = spark.read.parquet(str(dataset_path))
-    assert feature_df.count() == 5
+    assert feature_df.count() == 6
 
     # Strict schema and leakage verification
     expected_cols = {TARGET_COLUMN, *FEATURE_ALLOWLIST}
@@ -170,9 +184,13 @@ def test_feature_pipeline_target_classification_and_reconciliation(
         assert prohibited.lower() not in actual_cols
 
     # Verify extracted clock and calendar features
-    midnight_row = feature_df.where("crs_arr_hour = 0 AND crs_arr_minute = 0").first()
-    assert midnight_row is not None
-    assert midnight_row["is_weekend"] == 1  # Sunday
+    midnight_arr_row = feature_df.where("crs_arr_hour = 0 AND crs_arr_minute = 0").first()
+    assert midnight_arr_row is not None
+    assert midnight_arr_row["is_weekend"] == 1  # Sunday
+
+    midnight_dep_row = feature_df.where("crs_dep_hour = 0 AND crs_dep_minute = 0").first()
+    assert midnight_dep_row is not None
+    assert midnight_dep_row["day_of_week"] == 2  # Tuesday
 
     saturday_row = feature_df.where("day_of_week = 6").first()
     assert saturday_row is not None
@@ -191,7 +209,7 @@ def test_feature_pipeline_target_classification_and_reconciliation(
     assert report_file.is_file()
     saved_report = json.loads(report_file.read_text(encoding="utf-8"))
     assert saved_report["counts_reconcile"] is True
-    assert saved_report["eligible_rows"] == 5
+    assert saved_report["eligible_rows"] == 6
 
 
 def test_feature_pipeline_empty_input_produces_empty_schema_parquet(
@@ -229,5 +247,19 @@ def test_feature_pipeline_rejects_identical_input_and_output_path(
     with pytest.raises(FeatureEngineeringError, match="Output path cannot be identical"):
         build_feature_dataset(
             FeatureConfig(input_path=data_dir, output_path=data_dir),
+            spark=spark,
+        )
+
+
+def test_feature_pipeline_rejects_output_nested_inside_input(
+    tmp_path: Path,
+    spark: SparkSession,
+) -> None:
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    nested_dir = data_dir / "features"
+    with pytest.raises(FeatureEngineeringError, match="Output path cannot be inside"):
+        build_feature_dataset(
+            FeatureConfig(input_path=data_dir, output_path=nested_dir),
             spark=spark,
         )
