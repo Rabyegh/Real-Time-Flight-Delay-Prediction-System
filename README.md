@@ -486,7 +486,202 @@ uv run mlflow ui --backend-store-uri file:./mlruns --port 5000
 
 Open <http://localhost:5000> in your browser to inspect the tracked experiments.
 
+## Real-Time Ingestion Pipeline with Kafka and Spark Structured Streaming (Phase 5)
+
+Phase 5 introduces a reliable, locally runnable real-time streaming ingestion pipeline built
+with Apache Kafka and PySpark Structured Streaming. The pipeline bridges pre-departure live flight
+events with downstream analytics while upholding strict leakage prevention, schema validation,
+and stateful stream deduplication.
+
+### Streaming Architecture
+
+```text
+┌─────────────────────────────────┐
+│ Synthetic / Live Event Producer │ (CLI: flight-delay-produce)
+└────────────────┬────────────────┘
+                 │ JSON Events (schema_version: 1.0.0)
+                 ▼
+┌─────────────────────────────────┐
+│     Kafka: flight-events        │ (Port 9092 host / 29092 container)
+└───────┬─────────────────┬───────┘
+        │                 │ (Independent consumer streams)
+        ▼                 ▼
+┌──────────────────┐    ┌──────────────────────────────────────────────┐
+│ Valid Stream Q1  │    │ Rejected Stream Q2 (Parquet) & Q3 (Kafka DLQ)│
+│ Spark readStream │    │ Spark readStream                             │
+│ Checkpoint:      │    │ Checkpoints: checkpoints/rejected            │
+│ checkpoints/valid│    │              checkpoints/kafka_dlq           │
+└───────┬──────────┘    └───────────────────────┬──────────────────────┘
+        │ Valid Parquet                         │ Rejected Parquet & DLQ
+        ▼                                       ▼
+┌──────────────────┐            ┌──────────────────────────────────────┐
+│  data/streaming/ │            │ Local Sink: data/streaming/rejected/ │
+│  valid/          │            │ Kafka DLQ:  flight-events-dlq topic  │
+└──────────────────┘            └──────────────────────────────────────┘
+```
+
+### Event Contract (`1.0.0`)
+
+The streaming contract standardizes live pre-departure flight events, matching the historical BTS
+15-feature standard:
+
+```json
+{
+  "event_id": "8f38d4e1bf248d689b09930fec6561f7",
+  "schema_version": "1.0.0",
+  "event_timestamp": "2023-06-25T14:30:00Z",
+  "ingestion_timestamp": "2023-06-25T14:30:05Z",
+  "source": {
+    "system": "synthetic-producer",
+    "environment": "development",
+    "is_synthetic": "true"
+  },
+  "carrier": "AA",
+  "flight_number": "AA101",
+  "origin": "DFW",
+  "dest": "ORD",
+  "fl_date": "2023-06-25",
+  "crs_dep_time": "1430",
+  "crs_dep_hour": 14,
+  "crs_dep_minute": 30,
+  "dep_time_blk": "1400-1459",
+  "crs_arr_hour": 16,
+  "crs_arr_minute": 55,
+  "arr_time_blk": "1600-1659",
+  "month": 6,
+  "day_of_month": 25,
+  "day_of_week": 7,
+  "is_weekend": 1,
+  "crs_elapsed_time": 145.0,
+  "distance": 802.0
+}
+```
+
+- **Envelope Metadata:**
+  - `schema_version`: String identifier (fixed to `"1.0.0"`).
+  - `event_id`: Deterministic 32-character SHA-256 hex digest calculated over normalized business keys:
+    `sha256(f"{carrier}:{flight_number}:{origin}:{dest}:{fl_date}:{crs_dep_time}".encode("utf-8")).hexdigest()[:32]`.
+    Cannot be null, empty, or whitespace-only.
+  - `event_timestamp`: UTC ISO-8601 timestamp string (`YYYY-MM-DDTHH:MM:SSZ`).
+  - `ingestion_timestamp`: UTC ISO-8601 timestamp recorded at publication time.
+  - `source`: Map containing provenance metadata.
+- **Business Payload (15 prediction features):**
+  - Carrier & routing: `carrier` (2-3 char IATA), `flight_number`, `origin` (3-char IATA), `dest` (3-char IATA, $\ne \text{origin}$), `crs_elapsed_time` ($> 0.0$), `distance` ($> 0.0$).
+  - Scheduled timing: `crs_dep_time` (`HHMM`), `crs_dep_hour` ($0\text{--}23$), `crs_dep_minute` ($0\text{--}59$), `dep_time_blk` (`HHMM-HHMM`), `crs_arr_hour` ($0\text{--}23$), `crs_arr_minute` ($0\text{--}59$), `arr_time_blk` (`HHMM-HHMM`).
+  - Calendar: `fl_date` (`YYYY-MM-DD`), `month` ($1\text{--}12$), `day_of_month` ($1\text{--}31$), `day_of_week` ($1\text{--}7$, ISO standard), `is_weekend` ($0$ or $1$).
+
+### Timestamp Semantics
+
+To prevent timezone distortion and guarantee reliable watermarking:
+1. **Local Airport Schedule Times:** `crs_dep_time`, `crs_dep_hour`, `crs_dep_minute`, `crs_arr_hour`, and
+   `crs_arr_minute` represent **local airport scheduled times** exactly as published in airline timetables,
+   matching historical BTS definitions.
+2. **UTC Event Timestamps:** `event_timestamp` (and `ingestion_timestamp`) strictly follows a **UTC convention**
+   (`...Z` or `+00:00`). Watermarking and streaming state expiration in Spark Structured Streaming operate
+   exclusively on this parsed UTC timeline (`event_time`).
+
+### Strict Leakage Prevention
+
+Pre-departure prediction models must never receive post-departure actuals or target labels. The
+following 14 columns and patterns are strictly prohibited by `PROHIBITED_LEAKAGE_COLUMNS`:
+- `dep_delay`, `arr_delay`, `is_delayed_15`, `actual_elapsed_time`
+- `dep_time`, `arr_time`, `wheels_off`, `wheels_on`, `air_time`
+- `taxi_in`, `taxi_out`
+- `cancelled`, `cancellation_code`, `diverted`
+
+Streaming validation inspects raw JSON keys recursively (including nested dictionaries). If any prohibited
+key is found, the event is immediately flagged as `LEAKAGE_DETECTED` and routed to the Dead-Letter Queue.
+
+### Synthetic Kafka Producer
+
+The producer (`flight-delay-produce`) generates realistic flight events modeled after BTS traffic patterns
+and supports controlled error injection to test validation pipelines:
+
+```powershell
+# Run synthetic producer via Makefile (100 events at 10 events/sec)
+make kafka-produce
+
+# Or run via CLI with full options
+uv run flight-delay-produce `
+  --bootstrap-servers localhost:9092 `
+  --topic flight-events `
+  --rate 20.0 `
+  --count 500 `
+  --corrupt-prob 0.05
+
+# Dry run mode (generates and validates events locally without connecting to Kafka)
+uv run flight-delay-produce --dry-run --count 50 --corrupt-prob 0.1
+```
+
+Supported error injections:
+- Malformed unclosed JSON strings (`MALFORMED_JSON`).
+- Missing required fields (e.g. missing `carrier`).
+- Out-of-bounds numerical fields (`crs_dep_hour: 99`).
+- Post-departure leakage fields (`dep_delay: 45.0` or `dep_time: 1430`).
+- Negative distance or duration.
+
+### PySpark Structured Streaming Consumer
+
+The streaming consumer (`flight-delay-stream`) processes events from Kafka, performs schema validation,
+deduplicates within a watermark, writes valid records to Parquet, and routes invalid records to DLQ sinks:
+
+```powershell
+# Run streaming consumer via Makefile
+make stream
+
+# Or run via CLI with custom configuration and optional Kafka DLQ publishing
+uv run flight-delay-stream `
+  --bootstrap-servers localhost:9092 `
+  --topic flight-events `
+  --valid-output data/streaming/valid `
+  --rejected-output data/streaming/rejected `
+  --checkpoint-dir data/streaming/checkpoints `
+  --watermark "10 minutes" `
+  --trigger "5 seconds" `
+  --publish-dlq `
+  --dlq-topic flight-events-dlq
+```
+
+#### Dual Dead-Letter Queue (DLQ) Sinks
+Invalid records (schema parse errors, missing keys, empty event IDs, boundary errors, or leakage fields)
+are routed to:
+1. **Local Parquet Sink (`data/streaming/rejected`):** Contains `event_id`, `raw_payload` (original unparsed string),
+   `error_code`, `rejection_reason`, and `rejection_timestamp`.
+2. **Kafka DLQ Topic (`flight-events-dlq`):** Enabled when `--publish-dlq` is supplied. Publishes dead-letter
+   JSON records for real-time alerting.
+
+### Delivery Semantics & Sink Failure Limitations
+
+| Dimension | Mechanism | Guarantee / Behavior |
+|---|---|---|
+| **Kafka Ingestion** | Spark Kafka Source with checkpoint offsets | **At-least-once per query**. Committed offsets in write-ahead logs ensure no messages are lost across restarts. |
+| **In-Window Deduplication** | 10-minute watermark on `event_time` + `dropDuplicates(["event_id", "event_time"])` | **Within-watermark deduplication**. Replayed records with identical `event_id` and `event_time` within 10 minutes are dropped. Different `event_time` values produce separate records. |
+| **Late Data** | Spark Watermark | Records with `event_time < max(event_time) - 10 minutes` are dropped as late data. |
+| **Parquet Sinks** | Append mode with atomic `_spark_metadata` commit logs | **Append-only**. Re-running the pipeline from scratch on existing output folders without clearing creates duplicate part-files (`make stream-clean` resets state). |
+
+#### Important Sink Failure & Coordination Limitations
+- **Independent Sinks:** Valid Parquet, rejected Parquet, and Kafka DLQ operate as **separate streaming queries**
+  with distinct checkpoint subdirectories (`checkpoints/valid`, `checkpoints/rejected`, `checkpoints/kafka_dlq`).
+- **No Atomic Cross-Sink Transactions:** Spark Structured Streaming does not provide two-phase commit across separate
+  queries. If the Kafka DLQ broker fails or disk space is exhausted on one sink, that specific query will fail while
+  the other query may continue advancing Kafka offsets.
+- **Offset Desynchronization on Recovery:** After a partial sink failure, restarting the consumer resumes each query
+  from its own last-committed checkpoint offset, which may lead to temporary offset skew across sinks.
+- **End-to-End Exactly-Once Limitation:** The system does **not** provide end-to-end exactly-once delivery across
+  all sinks. In Phase 6, transactional upserts to an online feature store (Cassandra) using primary keys will provide
+  idempotent end-to-end writes.
+
+### Makefile Commands for Streaming
+
+```powershell
+make kafka-up       # Start Kafka broker via Docker Compose
+make kafka-topics   # Create flight-events and flight-events-dlq topics
+make kafka-produce  # Produce 100 synthetic events to Kafka
+make stream         # Start PySpark Structured Streaming consumer
+make stream-clean   # Clear local streaming outputs and checkpoints
+make kafka-down     # Stop Kafka container
+```
+
 ## Next milestone
 
-Phase 5: Real-time streaming infrastructure and feature serving (Kafka producers/consumers,
-Spark Structured Streaming, Cassandra feature store state, and real-time inference).
+Phase 6: Online Feature Store (Cassandra) and Real-Time Prediction Serving (FastAPI integration with MLflow-trained models).

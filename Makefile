@@ -6,8 +6,14 @@ TRAIN_INPUT ?= data/features/dataset
 TRAIN_OUTPUT ?= models/baseline
 MLFLOW_TRACKING_URI ?= file:./mlruns
 MLFLOW_EXPERIMENT ?= flight-delay-baseline
+KAFKA_BOOTSTRAP ?= localhost:9092
+KAFKA_TOPIC ?= flight-events
+KAFKA_DLQ_TOPIC ?= flight-events-dlq
+STREAM_VALID_OUT ?= data/streaming/valid
+STREAM_REJECTED_OUT ?= data/streaming/rejected
+STREAM_CHECKPOINTS ?= data/streaming/checkpoints
 
-.PHONY: install lint format test historical-etl features train up down logs smoke
+.PHONY: install lint format test historical-etl features train up down logs smoke kafka-up kafka-down kafka-topics kafka-produce stream stream-clean
 
 install:
 	uv sync --group dev
@@ -31,6 +37,25 @@ features:
 
 train:
 	uv run flight-delay-train --input "$(TRAIN_INPUT)" --output "$(TRAIN_OUTPUT)" --tracking-uri "$(MLFLOW_TRACKING_URI)" --experiment-name "$(MLFLOW_EXPERIMENT)"
+
+kafka-up:
+	docker compose --env-file .env.example up -d kafka
+
+kafka-down:
+	docker compose --env-file .env.example stop kafka
+
+kafka-topics:
+	docker compose --env-file .env.example exec kafka kafka-topics --bootstrap-server localhost:29092 --create --if-not-exists --topic $(KAFKA_TOPIC) --partitions 3 --replication-factor 1
+	docker compose --env-file .env.example exec kafka kafka-topics --bootstrap-server localhost:29092 --create --if-not-exists --topic $(KAFKA_DLQ_TOPIC) --partitions 1 --replication-factor 1
+
+kafka-produce:
+	uv run flight-delay-produce --bootstrap-servers "$(KAFKA_BOOTSTRAP)" --topic "$(KAFKA_TOPIC)" --count 100 --rate 10
+
+stream:
+	uv run flight-delay-stream --bootstrap-servers "$(KAFKA_BOOTSTRAP)" --topic "$(KAFKA_TOPIC)" --valid-output "$(STREAM_VALID_OUT)" --rejected-output "$(STREAM_REJECTED_OUT)" --checkpoint-dir "$(STREAM_CHECKPOINTS)"
+
+stream-clean:
+	python -c "import shutil; [shutil.rmtree(p, ignore_errors=True) for p in ['data/streaming/valid', 'data/streaming/rejected', 'data/streaming/checkpoints']]"
 
 up:
 	docker compose up --build -d

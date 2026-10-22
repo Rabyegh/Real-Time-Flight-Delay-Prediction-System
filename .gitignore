@@ -21,6 +21,7 @@ data/processed/
 data/features/
 data/samples/
 data/models/
+data/streaming/
 mlruns/
 mlartifacts/
 models/

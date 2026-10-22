@@ -19,6 +19,13 @@ class Settings(BaseSettings):
     app_env: str = "development"
     aviationstack_api_key: SecretStr | None = None
     kafka_bootstrap_servers: str = "localhost:9092"
+    kafka_flight_topic: str = "flight-events"
+    kafka_dead_letter_topic: str = "flight-events-dlq"
+    streaming_valid_output_dir: str = "data/streaming/valid"
+    streaming_rejected_output_dir: str = "data/streaming/rejected"
+    streaming_checkpoint_dir: str = "data/streaming/checkpoints"
+    streaming_watermark_delay: str = "10 minutes"
+    streaming_trigger_interval: str = "5 seconds"
     cassandra_host: str = "localhost"
     cassandra_port: int = Field(default=9042, ge=1, le=65535)
     mlflow_tracking_uri: str = "http://localhost:5000"

@@ -40,6 +40,8 @@ build-backend = "hatchling.build"
 flight-delay-etl = "flight_delay.processing.historical_etl:main"
 flight-delay-features = "flight_delay.processing.feature_engineering:main"
 flight-delay-train = "flight_delay.training.baseline:main"
+flight-delay-produce = "flight_delay.ingestion.kafka_producer:main"
+flight-delay-stream = "flight_delay.processing.streaming_consumer:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/flight_delay"]
