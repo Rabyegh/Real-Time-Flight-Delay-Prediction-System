@@ -5,6 +5,7 @@ from flight_delay.training.baseline import (
     NUMERICAL_FEATURES,
     DatasetSplit,
     DataSplitError,
+    MLflowTrackingError,
     ModelTrainingError,
     PathSafetyError,
     SchemaValidationError,
@@ -20,7 +21,9 @@ from flight_delay.training.baseline import (
     load_feature_dataset,
     split_dataset_chronological,
     train_and_evaluate,
+    validate_experiment_name,
     validate_split_config,
+    validate_tracking_uri,
     validate_training_paths,
 )
 
@@ -29,6 +32,7 @@ __all__ = [
     "NUMERICAL_FEATURES",
     "DataSplitError",
     "DatasetSplit",
+    "MLflowTrackingError",
     "ModelTrainingError",
     "PathSafetyError",
     "SchemaValidationError",
@@ -44,6 +48,8 @@ __all__ = [
     "load_feature_dataset",
     "split_dataset_chronological",
     "train_and_evaluate",
+    "validate_experiment_name",
     "validate_split_config",
+    "validate_tracking_uri",
     "validate_training_paths",
 ]

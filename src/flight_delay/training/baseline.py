@@ -5,7 +5,9 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import sys
+import urllib.parse
 from collections.abc import Sequence
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -78,6 +80,40 @@ class DataSplitError(ModelTrainingError):
 
 class PathSafetyError(ModelTrainingError):
     """Raised when output artifact directory collides with or nests inside input dataset."""
+
+
+class MLflowTrackingError(ModelTrainingError):
+    """Raised when MLflow tracking URI, experiment, or run configuration fails."""
+
+
+def validate_tracking_uri(tracking_uri: str | None) -> str:
+    """Validate and resolve MLflow tracking URI."""
+    if tracking_uri is not None:
+        trimmed = tracking_uri.strip()
+        if not trimmed:
+            raise MLflowTrackingError("MLflow tracking URI cannot be empty or whitespace.")
+        uri = trimmed
+    else:
+        env_uri = os.environ.get("MLFLOW_TRACKING_URI", "").strip()
+        uri = env_uri if env_uri else "file:./mlruns"
+
+    parsed = urllib.parse.urlparse(uri)
+    valid_schemes = {"", "file", "http", "https", "sqlite", "postgresql", "mysql", "mssql"}
+    if parsed.scheme and parsed.scheme.lower() not in valid_schemes:
+        raise MLflowTrackingError(
+            f"Unsupported or invalid MLflow tracking URI scheme '{parsed.scheme}': {uri}"
+        )
+    return uri
+
+
+def validate_experiment_name(experiment_name: str | None) -> str:
+    """Validate and resolve MLflow experiment name."""
+    if experiment_name is None:
+        return "flight-delay-baseline"
+    name = experiment_name.strip()
+    if not name:
+        raise MLflowTrackingError("MLflow experiment name cannot be empty or whitespace.")
+    return name
 
 
 def validate_training_paths(input_path: Path | str, output_dir: Path | str) -> tuple[Path, Path]:
@@ -162,7 +198,7 @@ class SplitConfig:
 
 @dataclass(frozen=True)
 class TrainingConfig:
-    """Configuration for baseline training and evaluation."""
+    """Configuration for baseline training, evaluation, and experiment tracking."""
 
     input_path: Path = Path("data/features/dataset")
     output_dir: Path = Path("models/baseline")
@@ -171,6 +207,10 @@ class TrainingConfig:
     max_iter: int = 500
     random_state: int = 42
     split_config: SplitConfig = field(default_factory=SplitConfig)
+    tracking_uri: str | None = None
+    experiment_name: str = "flight-delay-baseline"
+    run_name: str | None = None
+    enable_mlflow: bool = True
 
 
 @dataclass
@@ -641,6 +681,163 @@ def _generate_markdown_report(metrics: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _log_mlflow_run(
+    config: TrainingConfig,
+    split: DatasetSplit,
+    lr_pipeline: Pipeline,
+    dummy: DummyClassifier,
+    metrics: dict[str, Any],
+    output_dir: Path,
+) -> dict[str, str]:
+    """Log parameters, metrics, tags, and model artifacts to MLflow."""
+    import datetime
+
+    import mlflow
+    import mlflow.sklearn
+    from mlflow.models import infer_signature
+
+    tracking_uri = validate_tracking_uri(config.tracking_uri)
+    experiment_name = validate_experiment_name(config.experiment_name)
+
+    try:
+        mlflow.set_tracking_uri(tracking_uri)
+        mlflow.set_experiment(experiment_name)
+    except Exception as exc:
+        raise MLflowTrackingError(
+            f"Failed to initialize MLflow experiment '{experiment_name}' at '{tracking_uri}': {exc}"
+        ) from exc
+
+    if mlflow.active_run():
+        mlflow.end_run()
+
+    timestamp_str = datetime.datetime.now(datetime.UTC).strftime("%Y%m%d_%H%M%S")
+    run_name = config.run_name or f"logistic-regression-baseline-{timestamp_str}"
+
+    lr_eval_train = metrics["models"]["logistic_regression"]["evaluation"]["train"]
+    lr_eval_val = metrics["models"]["logistic_regression"]["evaluation"]["validation"]
+    lr_eval_test = metrics["models"]["logistic_regression"]["evaluation"]["test"]
+    dummy_eval_test = metrics["models"]["majority_baseline"]["evaluation"]["test"]
+    cmp = metrics["comparison_summary"]
+
+    with mlflow.start_run(run_name=run_name) as run:
+        # 1. Tags
+        mlflow.set_tags(
+            {
+                "model_family": "baseline",
+                "algorithm": "logistic_regression",
+                "target_column": TARGET_COLUMN,
+                "temporal_scope": "2023-02,2023-06",
+                "split_strategy": "chronological_date_disjoint",
+                "validation_role": "temporal_monitoring_and_tuning_reserve",
+                "test_role": "isolated_final_evaluation",
+                "production_ready": "false",
+            }
+        )
+
+        # 2. Parameters
+        mlflow.log_params(
+            {
+                "model_type": "LogisticRegression",
+                "solver": "lbfgs",
+                "max_iter": config.max_iter,
+                "random_state": config.random_state,
+                "class_weight": str(config.class_weight),
+                "decision_threshold": config.decision_threshold,
+                "target_column": TARGET_COLUMN,
+                "delay_threshold_minutes": 15.0,
+                "feature_count": len(FEATURE_ALLOWLIST),
+                "categorical_features": ",".join(CATEGORICAL_FEATURES),
+                "numerical_features": ",".join(NUMERICAL_FEATURES),
+                "train_dates": split.metadata.train_dates,
+                "val_dates": split.metadata.val_dates,
+                "test_dates": split.metadata.test_dates,
+                "train_rows": split.metadata.train_rows,
+                "val_rows": split.metadata.val_rows,
+                "test_rows": split.metadata.test_rows,
+                "total_rows": split.metadata.total_rows,
+                "dates_disjoint": str(split.metadata.dates_disjoint),
+            }
+        )
+
+        # 3. Metrics (Train, Validation, and Test separated)
+        mlflow.log_metrics(
+            {
+                "train_accuracy": lr_eval_train["accuracy"],
+                "train_precision": lr_eval_train["precision"],
+                "train_recall": lr_eval_train["recall"],
+                "train_f1_score": lr_eval_train["f1_score"],
+                "train_roc_auc": lr_eval_train["roc_auc"],
+                "train_pr_auc": lr_eval_train["pr_auc"],
+                "train_positive_prevalence": lr_eval_train["positive_prevalence"],
+                "val_accuracy": lr_eval_val["accuracy"],
+                "val_precision": lr_eval_val["precision"],
+                "val_recall": lr_eval_val["recall"],
+                "val_f1_score": lr_eval_val["f1_score"],
+                "val_roc_auc": lr_eval_val["roc_auc"],
+                "val_pr_auc": lr_eval_val["pr_auc"],
+                "val_positive_prevalence": lr_eval_val["positive_prevalence"],
+                "val_true_negative": lr_eval_val["confusion_matrix"]["true_negative"],
+                "val_false_positive": lr_eval_val["confusion_matrix"]["false_positive"],
+                "val_false_negative": lr_eval_val["confusion_matrix"]["false_negative"],
+                "val_true_positive": lr_eval_val["confusion_matrix"]["true_positive"],
+                "test_accuracy": lr_eval_test["accuracy"],
+                "test_precision": lr_eval_test["precision"],
+                "test_recall": lr_eval_test["recall"],
+                "test_f1_score": lr_eval_test["f1_score"],
+                "test_roc_auc": lr_eval_test["roc_auc"],
+                "test_pr_auc": lr_eval_test["pr_auc"],
+                "test_positive_prevalence": lr_eval_test["positive_prevalence"],
+                "test_true_negative": lr_eval_test["confusion_matrix"]["true_negative"],
+                "test_false_positive": lr_eval_test["confusion_matrix"]["false_positive"],
+                "test_false_negative": lr_eval_test["confusion_matrix"]["false_negative"],
+                "test_true_positive": lr_eval_test["confusion_matrix"]["true_positive"],
+                "test_accuracy_vs_dummy": cmp["test_accuracy_vs_dummy"],
+                "test_roc_auc_vs_dummy": cmp["test_roc_auc_vs_dummy"],
+                "test_pr_auc_vs_dummy": cmp["test_pr_auc_vs_dummy"],
+                "test_f1_vs_dummy": cmp["test_f1_vs_dummy"],
+                "dummy_test_accuracy": dummy_eval_test["accuracy"],
+                "dummy_test_roc_auc": dummy_eval_test["roc_auc"],
+                "dummy_test_pr_auc": dummy_eval_test["pr_auc"],
+            }
+        )
+
+        # 4. Model Artifact with Schema Signature
+        sample_input = split.X_test.head(5)
+        signature = infer_signature(sample_input, lr_pipeline.predict(sample_input))
+        mlflow.sklearn.log_model(
+            sk_model=lr_pipeline,
+            artifact_path="model",
+            signature=signature,
+            input_example=sample_input,
+        )
+
+        # 5. File Artifacts
+        for artifact_name in [
+            "model.joblib",
+            "dummy_model.joblib",
+            "evaluation_metrics.json",
+            "split_metadata.json",
+            "evaluation_report.md",
+        ]:
+            file_path = output_dir / artifact_name
+            if file_path.is_file():
+                mlflow.log_artifact(str(file_path), artifact_path="artifacts")
+
+        run_info = {
+            "run_id": run.info.run_id,
+            "experiment_id": run.info.experiment_id,
+            "tracking_uri": tracking_uri,
+            "run_name": run_name,
+        }
+        LOGGER.info(
+            "MLflow tracking completed: run_id=%s, experiment=%s at %s",
+            run_info["run_id"],
+            experiment_name,
+            tracking_uri,
+        )
+        return run_info
+
+
 def train_and_evaluate(config: TrainingConfig | None = None) -> dict[str, Any]:
     """Execute the full training, validation, evaluation, and artifact saving pipeline."""
     import datetime
@@ -775,6 +972,15 @@ def train_and_evaluate(config: TrainingConfig | None = None) -> dict[str, Any]:
         "Training artifacts successfully written to %s (model, dummy, metrics, split, report)",
         output_dir,
     )
+
+    # 7. MLflow Experiment Tracking
+    if config.enable_mlflow:
+        mlflow_info = _log_mlflow_run(config, split, lr_pipeline, dummy, metrics, output_dir)
+        metrics["mlflow"] = mlflow_info
+        metrics_path.write_text(json.dumps(metrics, indent=2) + "\n", encoding="utf-8")
+    else:
+        metrics["mlflow"] = None
+
     return metrics
 
 
@@ -819,6 +1025,29 @@ def _argument_parser() -> argparse.ArgumentParser:
         default=42,
         help="Random seed for reproducibility (default: 42)",
     )
+    parser.add_argument(
+        "--tracking-uri",
+        type=str,
+        default=None,
+        help="MLflow tracking URI (default: MLFLOW_TRACKING_URI env var or file:./mlruns)",
+    )
+    parser.add_argument(
+        "--experiment-name",
+        type=str,
+        default="flight-delay-baseline",
+        help="MLflow experiment name (default: flight-delay-baseline)",
+    )
+    parser.add_argument(
+        "--run-name",
+        type=str,
+        default=None,
+        help="MLflow run name (default: auto-generated timestamped name)",
+    )
+    parser.add_argument(
+        "--no-mlflow",
+        action="store_true",
+        help="Disable MLflow experiment tracking",
+    )
     return parser
 
 
@@ -837,6 +1066,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         class_weight=class_weight,
         max_iter=args.max_iter,
         random_state=args.random_state,
+        tracking_uri=args.tracking_uri,
+        experiment_name=args.experiment_name,
+        run_name=args.run_name,
+        enable_mlflow=not args.no_mlflow,
     )
     try:
         results = train_and_evaluate(config)

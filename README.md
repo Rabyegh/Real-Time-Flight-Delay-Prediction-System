@@ -416,7 +416,77 @@ commands directly.
   `docker compose logs <service>`. Cassandra and the first MinIO/Kafka startup
   can take longer than the API.
 
+## MLflow Experiment Tracking (Phase 4)
+
+MLflow experiment tracking is integrated into the baseline model training pipeline to record
+reproducible hyperparameters, separated temporal evaluation metrics, model signatures, and
+training artifacts.
+
+### Configuration & CLI Options
+
+The training pipeline supports flexible MLflow configuration via CLI flags, environment variables,
+or `Makefile` targets:
+
+| Parameter | CLI Flag | Default | Description |
+|---|---|---|---|
+| Tracking URI | `--tracking-uri` | `file:./mlruns` or `$MLFLOW_TRACKING_URI` | MLflow tracking backend URI (local directory or remote store) |
+| Experiment Name | `--experiment-name` | `flight-delay-baseline` | Name of the MLflow experiment |
+| Run Name | `--run-name` | `logistic-regression-baseline-YYYYMMDD_HHMMSS` | Descriptive identifier for the run |
+| Disable Tracking | `--no-mlflow` | False | Disables MLflow tracking when running offline or in unit tests |
+
+### Running Training with MLflow Tracking
+
+```powershell
+# Using default local file store (./mlruns) and default experiment via Makefile
+make train
+
+# Or specify custom tracking URI and experiment name via CLI
+uv run flight-delay-train `
+  --input data/features/dataset `
+  --output models/baseline `
+  --tracking-uri file:./mlruns `
+  --experiment-name flight-delay-baseline `
+  --run-name logistic-regression-baseline-run
+
+# Run with MLflow disabled
+uv run flight-delay-train --no-mlflow
+```
+
+### Logged Run Information
+
+Each MLflow run logs:
+- **Tags:** `model_family="baseline"`, `algorithm="logistic_regression"`, `target_column="is_delayed_15"`,
+  `split_strategy="chronological_date_disjoint"`, `validation_role="temporal_monitoring_and_tuning_reserve"`,
+  `test_role="isolated_final_evaluation"`, `production_ready="false"`.
+- **Parameters:** Model hyperparameters (`max_iter`, `solver`, `class_weight`, `random_state`,
+  `decision_threshold`), dataset split dates (`train_dates`, `val_dates`, `test_dates`), sample counts
+  (`train_rows`, `val_rows`, `test_rows`, `total_rows`), and feature lists (`feature_count=15`, categorical
+  and numerical feature sets).
+- **Metrics:** Train, validation, and test metrics are logged with explicit partition prefixes:
+  - **Train:** `train_accuracy`, `train_precision`, `train_recall`, `train_f1_score`, `train_roc_auc`,
+    `train_pr_auc`, `train_positive_prevalence`.
+  - **Validation:** `val_accuracy`, `val_precision`, `val_recall`, `val_f1_score`, `val_roc_auc`,
+    `val_pr_auc`, `val_positive_prevalence`, and confusion matrix counts (`val_true_negative`,
+    `val_false_positive`, `val_false_negative`, `val_true_positive`).
+  - **Test:** `test_accuracy`, `test_precision`, `test_recall`, `test_f1_score`, `test_roc_auc`,
+    `test_pr_auc`, `test_positive_prevalence`, confusion matrix counts, and deltas vs. dummy baseline
+    (`test_accuracy_vs_dummy`, `test_roc_auc_vs_dummy`, `test_pr_auc_vs_dummy`, `test_f1_vs_dummy`).
+- **Model Artifact:** Serialized scikit-learn pipeline logged via `mlflow.sklearn.log_model` under `model`,
+  including inferred input schema signature and input example.
+- **Disk Artifacts:** All local artifacts mirrored under `artifacts/` (`model.joblib`, `dummy_model.joblib`,
+  `evaluation_metrics.json`, `split_metadata.json`, and `evaluation_report.md`).
+
+### Inspecting Runs Locally in the MLflow UI
+
+Launch the MLflow user interface to compare runs, visualize ROC/PR metrics, inspect parameters, and download artifacts:
+
+```powershell
+uv run mlflow ui --backend-store-uri file:./mlruns --port 5000
+```
+
+Open <http://localhost:5000> in your browser to inspect the tracked experiments.
+
 ## Next milestone
 
-Phase 4: Real-time streaming infrastructure and feature serving (Kafka producers/consumers,
+Phase 5: Real-time streaming infrastructure and feature serving (Kafka producers/consumers,
 Spark Structured Streaming, Cassandra feature store state, and real-time inference).

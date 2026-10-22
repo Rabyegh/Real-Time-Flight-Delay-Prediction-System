@@ -3,6 +3,8 @@
 from pathlib import Path
 
 import joblib
+import mlflow
+import mlflow.sklearn
 import pandas as pd
 import pytest
 
@@ -126,6 +128,7 @@ def test_full_training_pipeline_generates_all_artifacts_and_metrics(tmp_path: Pa
         output_dir=output_dir,
         max_iter=100,
         random_state=42,
+        tracking_uri=(tmp_path / "mlruns").as_uri(),
     )
 
     metrics = train_and_evaluate(config)
@@ -227,6 +230,8 @@ def test_cli_execution_with_arguments(tmp_path: Path) -> None:
             "50",
             "--random-state",
             "42",
+            "--tracking-uri",
+            (tmp_path / "mlruns").as_uri(),
         ]
     )
 
@@ -251,4 +256,165 @@ def test_cli_fails_on_colliding_paths(tmp_path: Path) -> None:
 def test_cli_fails_on_missing_dataset(tmp_path: Path) -> None:
     nonexistent = tmp_path / "missing_data"
     exit_code = main(["--input", str(nonexistent)])
+    assert exit_code == 2
+
+
+def test_full_training_pipeline_logs_to_mlflow_local_store(tmp_path: Path) -> None:
+    dataset_file = _generate_synthetic_feature_dataset(tmp_path / "features")
+    output_dir = tmp_path / "models" / "baseline"
+    mlruns_dir = tmp_path / "mlruns"
+    tracking_uri = mlruns_dir.as_uri()
+
+    config = TrainingConfig(
+        input_path=dataset_file,
+        output_dir=output_dir,
+        max_iter=50,
+        random_state=42,
+        tracking_uri=tracking_uri,
+        experiment_name="test-flight-delay",
+        run_name="test-run-baseline",
+        enable_mlflow=True,
+    )
+
+    metrics = train_and_evaluate(config)
+    assert metrics["mlflow"] is not None
+    run_id = metrics["mlflow"]["run_id"]
+    experiment_id = metrics["mlflow"]["experiment_id"]
+
+    client = mlflow.tracking.MlflowClient(tracking_uri=tracking_uri)
+    run = client.get_run(run_id)
+
+    assert run.info.status == "FINISHED"
+    assert run.info.experiment_id == experiment_id
+    assert run.data.tags["model_family"] == "baseline"
+    assert run.data.tags["algorithm"] == "logistic_regression"
+
+    # Verify parameters
+    assert run.data.params["model_type"] == "LogisticRegression"
+    assert run.data.params["max_iter"] == "50"
+    assert run.data.params["feature_count"] == "15"
+    assert run.data.params["target_column"] == "is_delayed_15"
+
+    # Verify separated metrics
+    for metric_name in (
+        "train_accuracy",
+        "val_accuracy",
+        "test_accuracy",
+        "val_roc_auc",
+        "test_roc_auc",
+        "val_pr_auc",
+        "test_pr_auc",
+        "test_accuracy_vs_dummy",
+    ):
+        assert metric_name in run.data.metrics
+        assert isinstance(run.data.metrics[metric_name], float)
+
+    # Verify artifacts
+    artifacts = [a.path for a in client.list_artifacts(run_id)]
+    assert "model" in artifacts
+    assert "artifacts" in artifacts
+
+    sub_artifacts = [a.path for a in client.list_artifacts(run_id, path="artifacts")]
+    for expected in (
+        "artifacts/model.joblib",
+        "artifacts/dummy_model.joblib",
+        "artifacts/evaluation_metrics.json",
+        "artifacts/split_metadata.json",
+        "artifacts/evaluation_report.md",
+    ):
+        assert expected in sub_artifacts
+
+    # Verify model artifact can be reloaded via mlflow.sklearn
+    loaded_model = mlflow.sklearn.load_model(f"runs:/{run_id}/model")
+    test_sample = pd.DataFrame(
+        [
+            {
+                "carrier": "AA",
+                "origin": "JFK",
+                "dest": "BOS",
+                "crs_dep_hour": 8,
+                "crs_dep_minute": 30,
+                "dep_time_blk": "0800-0859",
+                "crs_arr_hour": 10,
+                "crs_arr_minute": 0,
+                "arr_time_blk": "1000-1059",
+                "month": 6,
+                "day_of_month": 28,
+                "day_of_week": 4,
+                "is_weekend": 0,
+                "crs_elapsed_time": 90.0,
+                "distance": 200.0,
+            }
+        ]
+    )[list(FEATURE_ALLOWLIST)]
+    prediction = loaded_model.predict(test_sample)
+    assert prediction[0] in (0, 1)
+
+
+def test_training_pipeline_with_mlflow_disabled(tmp_path: Path) -> None:
+    dataset_file = _generate_synthetic_feature_dataset(tmp_path / "features")
+    output_dir = tmp_path / "models" / "baseline"
+
+    config = TrainingConfig(
+        input_path=dataset_file,
+        output_dir=output_dir,
+        max_iter=50,
+        random_state=42,
+        enable_mlflow=False,
+    )
+
+    metrics = train_and_evaluate(config)
+    assert metrics["status"] == "completed"
+    assert metrics["mlflow"] is None
+
+
+def test_cli_execution_with_mlflow_flags(tmp_path: Path) -> None:
+    dataset_file = _generate_synthetic_feature_dataset(tmp_path / "features")
+    output_dir = tmp_path / "models" / "cli_output"
+    mlruns_dir = tmp_path / "mlruns"
+    tracking_uri = mlruns_dir.as_uri()
+
+    exit_code = main(
+        [
+            "--input",
+            str(dataset_file),
+            "--output",
+            str(output_dir),
+            "--max-iter",
+            "50",
+            "--random-state",
+            "42",
+            "--tracking-uri",
+            tracking_uri,
+            "--experiment-name",
+            "cli-experiment",
+            "--run-name",
+            "cli-run-1",
+        ]
+    )
+
+    assert exit_code == 0
+    assert (output_dir / "model.joblib").exists()
+    client = mlflow.tracking.MlflowClient(tracking_uri=tracking_uri)
+    experiment = client.get_experiment_by_name("cli-experiment")
+    assert experiment is not None
+    runs = client.search_runs(experiment_ids=[experiment.experiment_id])
+    assert len(runs) == 1
+    assert runs[0].info.status == "FINISHED"
+
+
+def test_cli_fails_on_invalid_tracking_uri(tmp_path: Path) -> None:
+    dataset_file = _generate_synthetic_feature_dataset(tmp_path / "features")
+    output_dir = tmp_path / "models" / "cli_output"
+
+    exit_code = main(
+        [
+            "--input",
+            str(dataset_file),
+            "--output",
+            str(output_dir),
+            "--tracking-uri",
+            "ftp://invalid-server/tracking",
+        ]
+    )
     assert exit_code == 2

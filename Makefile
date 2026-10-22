@@ -4,6 +4,8 @@ FEATURES_INPUT ?= data/processed/accepted
 FEATURES_OUTPUT ?= data/features
 TRAIN_INPUT ?= data/features/dataset
 TRAIN_OUTPUT ?= models/baseline
+MLFLOW_TRACKING_URI ?= file:./mlruns
+MLFLOW_EXPERIMENT ?= flight-delay-baseline
 
 .PHONY: install lint format test historical-etl features train up down logs smoke
 
@@ -28,7 +30,7 @@ features:
 	uv run flight-delay-features --input "$(FEATURES_INPUT)" --output "$(FEATURES_OUTPUT)"
 
 train:
-	uv run flight-delay-train --input "$(TRAIN_INPUT)" --output "$(TRAIN_OUTPUT)"
+	uv run flight-delay-train --input "$(TRAIN_INPUT)" --output "$(TRAIN_OUTPUT)" --tracking-uri "$(MLFLOW_TRACKING_URI)" --experiment-name "$(MLFLOW_EXPERIMENT)"
 
 up:
 	docker compose up --build -d

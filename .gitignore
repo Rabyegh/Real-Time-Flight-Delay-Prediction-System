@@ -22,8 +22,11 @@ data/features/
 data/samples/
 data/models/
 mlruns/
+mlartifacts/
 models/
 artifacts/
+*.db
+*.sqlite
 
 # Editors and operating systems
 .idea/

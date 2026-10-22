@@ -11,6 +11,7 @@ from flight_delay.training.baseline import (
     CATEGORICAL_FEATURES,
     NUMERICAL_FEATURES,
     DataSplitError,
+    MLflowTrackingError,
     ModelTrainingError,
     PathSafetyError,
     SchemaValidationError,
@@ -23,7 +24,9 @@ from flight_delay.training.baseline import (
     load_feature_dataset,
     split_dataset_chronological,
     train_and_evaluate,
+    validate_experiment_name,
     validate_split_config,
+    validate_tracking_uri,
     validate_training_paths,
 )
 
@@ -382,3 +385,41 @@ def test_train_and_evaluate_rejects_single_class_training_set(tmp_path: Path) ->
         ModelTrainingError, match="Training dataset must contain both binary classes"
     ):
         train_and_evaluate(config)
+
+
+def test_validate_tracking_uri_accepts_valid_schemes(monkeypatch: pytest.MonkeyPatch) -> None:
+    assert validate_tracking_uri("file:./mlruns") == "file:./mlruns"
+    assert validate_tracking_uri("sqlite:///mlruns.db") == "sqlite:///mlruns.db"
+    assert validate_tracking_uri("http://localhost:5000") == "http://localhost:5000"
+    assert validate_tracking_uri("https://mlflow.example.com") == "https://mlflow.example.com"
+    assert validate_tracking_uri("mlruns") == "mlruns"
+
+    monkeypatch.delenv("MLFLOW_TRACKING_URI", raising=False)
+    assert validate_tracking_uri(None) == "file:./mlruns"
+
+    monkeypatch.setenv("MLFLOW_TRACKING_URI", "sqlite:///env_store.db")
+    assert validate_tracking_uri(None) == "sqlite:///env_store.db"
+
+
+def test_validate_tracking_uri_rejects_empty_and_unsupported_schemes() -> None:
+    with pytest.raises(MLflowTrackingError, match="cannot be empty or whitespace"):
+        validate_tracking_uri("")
+
+    with pytest.raises(MLflowTrackingError, match="cannot be empty or whitespace"):
+        validate_tracking_uri("   ")
+
+    with pytest.raises(
+        MLflowTrackingError, match="Unsupported or invalid MLflow tracking URI scheme"
+    ):
+        validate_tracking_uri("ftp://invalid-server/mlruns")
+
+
+def test_validate_experiment_name_accepts_valid_and_rejects_empty() -> None:
+    assert validate_experiment_name("my-experiment") == "my-experiment"
+    assert validate_experiment_name(None) == "flight-delay-baseline"
+
+    with pytest.raises(MLflowTrackingError, match="cannot be empty or whitespace"):
+        validate_experiment_name("")
+
+    with pytest.raises(MLflowTrackingError, match="cannot be empty or whitespace"):
+        validate_experiment_name("   ")
