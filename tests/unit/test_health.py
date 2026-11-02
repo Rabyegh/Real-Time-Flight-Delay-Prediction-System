@@ -1,20 +1,17 @@
 """Tests for the API health endpoint."""
 
-import asyncio
-
-from httpx import ASGITransport, AsyncClient
+from fastapi.testclient import TestClient
 
 from flight_delay.api.main import app
 
 
 def test_health_endpoint() -> None:
-    async def request_health():
-        async with AsyncClient(
-            transport=ASGITransport(app=app),
-            base_url="http://test",
-        ) as client:
-            return await client.get("/health")
-
-    response = asyncio.run(request_health())
-    assert response.status_code == 200
-    assert response.json() == {"status": "ok"}
+    with TestClient(app) as client:
+        response = client.get("/health")
+        assert response.status_code == 200
+        data = response.json()
+        assert "status" in data
+        assert "version" in data
+        assert "model_ready" in data
+        assert "cassandra_connected" in data
+        assert data["version"] == "0.1.0"

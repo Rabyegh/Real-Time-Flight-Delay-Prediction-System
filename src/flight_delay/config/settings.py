@@ -39,6 +39,9 @@ class Settings(BaseSettings):
     mlflow_port: int = Field(default=5000, ge=1, le=65535)
     prometheus_port: int = Field(default=9090, ge=1, le=65535)
     grafana_port: int = Field(default=3000, ge=1, le=65535)
+    api_max_batch_size: int = Field(default=100, ge=1, le=1000)
+    prediction_threshold: float = Field(default=0.5, ge=0.0, le=1.0)
+    app_version: str = "0.1.0"
 
     def require_aviationstack_api_key(self) -> SecretStr:
         """Return the configured source API key or explain how to provide one."""

@@ -682,6 +682,210 @@ make stream-clean   # Clear local streaming outputs and checkpoints
 make kafka-down     # Stop Kafka container
 ```
 
-## Next milestone
+---
 
-Phase 6: Online Feature Store (Cassandra) and Real-Time Prediction Serving (FastAPI integration with MLflow-trained models).
+## Phase 6 — Real-Time Prediction Pipeline, FastAPI Service & Observability
+
+### Phase 6 Overview
+
+Phase 6 completes the real-time prediction system by:
+
+1. **Subphase 3 (Cassandra Storage + Inference Engine)** — `CassandraStorage` with idempotent dual-table
+   upserts, `ModelPredictor` with a strict 15-feature contract, and `PredictionRecord` with deterministic
+   primary keys and UTC timestamp normalization.
+2. **Subphase 4 (FastAPI Prediction Service)** — REST API exposing model predictions and Cassandra queries.
+3. **Subphase 5 (Monitoring & Observability)** — Prometheus metrics, `/metrics` endpoint, and three Grafana dashboards.
+
+---
+
+### 6.1 API Endpoints
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/health` | Reports model readiness, Cassandra connectivity, and service version |
+| `POST` | `/api/v1/predictions` | Single flight delay prediction |
+| `POST` | `/api/v1/predictions/batch` | Batch predictions (up to `API_MAX_BATCH_SIZE`, default 100) |
+| `GET` | `/api/v1/predictions/{event_id}` | Retrieve persisted prediction by event ID |
+| `GET` | `/api/v1/airports/{airport}/predictions` | Recent predictions by airport and date bucket |
+| `GET` | `/metrics` | Prometheus-format metrics scrape endpoint |
+
+**Health response status values:**
+
+- `ok` model loaded, Cassandra connected
+- `degraded` model loaded, Cassandra unreachable (API still serves predictions)
+- `unhealthy` model failed to load
+
+---
+
+### 6.2 Feature Contract
+
+The API strictly enforces the 15-feature pre-departure model contract:
+
+| Feature | Type | Constraints |
+|---------|------|-------------|
+| `carrier` | string | Non-empty |
+| `origin` | string | 3-letter IATA code |
+| `dest` | string | 3-letter IATA code |
+| `crs_dep_hour` | int | 0-23 |
+| `crs_dep_minute` | int | 0-59 |
+| `dep_time_blk` | string | Non-empty |
+| `crs_arr_hour` | int | 0-23 |
+| `crs_arr_minute` | int | 0-59 |
+| `arr_time_blk` | string | Non-empty |
+| `month` | int | 1-12 |
+| `day_of_month` | int | 1-31 |
+| `day_of_week` | int | 1-7 |
+| `is_weekend` | int | 0 or 1 |
+| `crs_elapsed_time` | float | > 0 |
+| `distance` | float | > 0 |
+
+Post-departure leakage columns (`arr_delay`, `dep_delay`, `actual_elapsed_time`, `air_time`, etc.) are
+**strictly rejected** at both the API schema and inference layer with HTTP 422.
+
+---
+
+### 6.3 Architecture
+
+```
+FastAPI (main.py)
+  |- Lifespan: loads ModelPredictor + opens CassandraStorage on startup
+  |- MetricsMiddleware: records all request latency and status codes
+  |- /health                           => HealthResponse
+  |- /api/v1/predictions               => ModelPredictor.predict_single()
+  |- /api/v1/predictions/batch         => ModelPredictor.predict()
+  |- /api/v1/predictions/{event_id}    => CassandraStorage.get_prediction_by_event()
+  |- /api/v1/airports/{a}/predictions  => CassandraStorage.get_predictions_by_airport()
+  `- /metrics                          => FlightDelayMetrics.generate_metrics_text()
+```
+
+- **Dependency injection** via `Annotated[..., Depends(...)]` for predictor, storage, metrics, and settings.
+- **Application factory** (`create_app()`) supports injectable mocks for isolated unit testing.
+- **Exception handlers** map `SchemaValidationError`, `InferenceError`, `StorageConnectionError`,
+  `StorageQueryError`, and `StorageValidationError` to appropriate HTTP status codes.
+
+---
+
+### 6.4 Monitoring & Observability
+
+#### Prometheus Metrics
+
+All metrics use the `flight_delay_` prefix and are exposed at `GET /metrics`.
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `flight_delay_events_received_total` | Counter | Ingestion events received by source |
+| `flight_delay_events_valid_total` | Counter | Valid events accepted |
+| `flight_delay_events_rejected_total` | Counter | Events rejected during validation |
+| `flight_delay_kafka_errors_total` | Counter | Kafka publish/consume errors |
+| `flight_delay_dead_letter_events_total` | Counter | Events sent to DLQ |
+| `flight_delay_streaming_microbatch_duration_seconds` | Histogram | Spark micro-batch duration |
+| `flight_delay_streaming_input_rows_per_second` | Gauge | Streaming input throughput |
+| `flight_delay_streaming_processed_rows_per_second` | Gauge | Streaming processed throughput |
+| `flight_delay_streaming_query_status` | Gauge | Query running status (1=running) |
+| `flight_delay_streaming_query_failures_total` | Counter | Query termination failures |
+| `flight_delay_predictions_total` | Counter | Predictions by model version and delay status |
+| `flight_delay_prediction_latency_seconds` | Histogram | Model inference latency |
+| `flight_delay_model_version_info` | Gauge | Active model version and threshold |
+| `flight_delay_prediction_errors_total` | Counter | Inference errors |
+| `flight_delay_cassandra_writes_total` | Counter | Cassandra writes by table and status |
+| `flight_delay_cassandra_write_latency_seconds` | Histogram | Cassandra write latency |
+| `flight_delay_cassandra_connectivity_status` | Gauge | Connection status (1=connected) |
+| `flight_delay_api_requests_total` | Counter | HTTP requests by endpoint, method, status |
+| `flight_delay_api_request_latency_seconds` | Histogram | HTTP request latency |
+| `flight_delay_api_errors_total` | Counter | HTTP 5xx errors |
+
+Each `FlightDelayMetrics` instance uses an isolated `CollectorRegistry`.
+Tests must not share the global Prometheus registry to avoid duplicate-registration errors.
+
+#### Grafana Dashboards
+
+Three provisioned dashboards in `docker/grafana/dashboards/`:
+
+| Dashboard | File | Content |
+|-----------|------|---------|
+| Streaming Pipeline Overview | `streaming_pipeline_overview.json` | Event throughput, DLQ rates, micro-batch duration |
+| ML Prediction Monitoring | `ml_prediction_monitoring.json` | Prediction rate, latency, delay ratio, model version |
+| API and Storage Health | `api_and_storage_health.json` | API request rate, latency, Cassandra write health |
+
+#### Prometheus Scrape Configuration
+
+`configs/prometheus.yml` scrapes:
+
+- `prometheus:9090` Prometheus self-monitoring
+- `api:8000` FastAPI `/metrics` endpoint
+
+---
+
+### 6.5 Running the Full Stack
+
+#### Start infrastructure (requires Docker)
+
+```powershell
+docker compose up -d
+```
+
+This starts: Kafka, Cassandra, MinIO, MLflow, FastAPI (port 8000), Prometheus (port 9090), Grafana (port 3000).
+
+#### Initialize Cassandra schema
+
+```powershell
+docker exec -i flight-delay-cassandra-1 cqlsh < scripts/cassandra/01_init_schema.cql
+```
+
+#### Produce synthetic Kafka events
+
+```powershell
+uv run python -m flight_delay.ingestion.kafka_producer --count 100
+```
+
+#### Start Spark Structured Streaming consumer
+
+```powershell
+uv run python -m flight_delay.processing.streaming_consumer
+```
+
+#### Query the API
+
+```powershell
+# Health check
+Invoke-WebRequest http://localhost:8000/health
+
+# Prometheus metrics
+Invoke-WebRequest http://localhost:8000/metrics
+
+# Airport predictions
+Invoke-WebRequest "http://localhost:8000/api/v1/airports/ORD/predictions?date=2026-11-02&limit=50"
+```
+
+#### View Grafana dashboards
+
+Open http://localhost:3000, log in with `GRAFANA_ADMIN_USER` and `GRAFANA_ADMIN_PASSWORD`,
+then navigate to **Flight Delay** dashboards.
+
+---
+
+### 6.6 Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `CASSANDRA_HOST` | `localhost` | Cassandra contact point |
+| `CASSANDRA_PORT` | `9042` | Native transport port |
+| `CASSANDRA_KEYSPACE` | `flight_delay` | Target keyspace |
+| `MODEL_ARTIFACT_PATH` | `models/baseline/model.joblib` | Path to trained model |
+| `PREDICTION_THRESHOLD` | `0.5` | Binary classification threshold |
+| `APP_VERSION` | `0.1.0` | Service version string |
+| `API_MAX_BATCH_SIZE` | `100` | Maximum records per batch request |
+| `API_PORT` | `8000` | Uvicorn listen port |
+| `PROMETHEUS_PORT` | `9090` | Prometheus scrape port |
+| `GRAFANA_PORT` | `3000` | Grafana UI port |
+
+---
+
+### 6.7 Known Limitations & Unverified Integrations
+
+| Limitation | Detail |
+|-----------|--------|
+| **Live Cassandra not verified locally** | All persistence tests use `SQLiteFakeCassandraStorage`. Real Cassandra write/read and CQL schema migration require a running cluster. Live validation requires Docker. |
+| **PySpark Hadoop NativeIO on Windows** | Integration tests for `test_prediction_pipeline.py` and `test_streaming_pipeline.py` fail on this machine due to missing `winutils.exe`. Install Hadoop winutils and set `HADOOP_HOME` to run these tests locally on Windows. |
+| **End-to-end streaming pipeline not verified** | Kafka to Spark to Cassandra to FastAPI retrieval requires live Docker infrastructure. Unit tests cover all components independently. |
+| **No API authentication** | The API does not implement authentication or authorization. Add API key or OAuth before network exposure. |

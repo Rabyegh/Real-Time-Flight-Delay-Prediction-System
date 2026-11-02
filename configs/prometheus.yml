@@ -5,3 +5,8 @@ scrape_configs:
   - job_name: prometheus
     static_configs:
       - targets: ["prometheus:9090"]
+
+  - job_name: flight-delay-api
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["api:8000"]

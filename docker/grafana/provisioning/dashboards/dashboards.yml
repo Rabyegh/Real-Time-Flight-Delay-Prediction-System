@@ -1,0 +1,11 @@
+apiVersion: 1
+
+providers:
+  - name: "Flight Delay Dashboards"
+    orgId: 1
+    folder: "Flight Delay"
+    type: file
+    disableDeletion: false
+    editable: true
+    options:
+      path: /var/lib/grafana/dashboards

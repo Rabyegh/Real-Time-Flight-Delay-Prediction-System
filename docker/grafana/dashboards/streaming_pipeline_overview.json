@@ -1,0 +1,185 @@
+{
+  "annotations": {
+    "list": []
+  },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 0,
+  "id": null,
+  "links": [],
+  "liveNow": false,
+  "panels": [
+    {
+      "id": 1,
+      "title": "Ingestion Event Throughput",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 0
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(flight_delay_events_received_total[1m]))",
+          "legendFormat": "Events Received / sec",
+          "refId": "A"
+        },
+        {
+          "expr": "sum(rate(flight_delay_events_valid_total[1m]))",
+          "legendFormat": "Valid Events / sec",
+          "refId": "B"
+        },
+        {
+          "expr": "sum(rate(flight_delay_events_rejected_total[1m]))",
+          "legendFormat": "Rejected Events / sec",
+          "refId": "C"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Micro-Batch Processing Duration (p50 & p95)",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 0
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(flight_delay_streaming_microbatch_duration_seconds_bucket[5m])) by (le))",
+          "legendFormat": "p95 Duration (s)",
+          "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.50, sum(rate(flight_delay_streaming_microbatch_duration_seconds_bucket[5m])) by (le))",
+          "legendFormat": "p50 Duration (s)",
+          "refId": "B"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Streaming Input vs Processed Rows / Sec",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "flight_delay_streaming_input_rows_per_second",
+          "legendFormat": "Input Rows/sec",
+          "refId": "A"
+        },
+        {
+          "expr": "flight_delay_streaming_processed_rows_per_second",
+          "legendFormat": "Processed Rows/sec",
+          "refId": "B"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Dead-Letter & Kafka Processing Errors",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "sum by (reason) (rate(flight_delay_dead_letter_events_total[1m]))",
+          "legendFormat": "DLQ: {{reason}}",
+          "refId": "A"
+        },
+        {
+          "expr": "sum by (error_type) (rate(flight_delay_kafka_errors_total[1m]))",
+          "legendFormat": "Kafka Err: {{error_type}}",
+          "refId": "B"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Streaming Query Execution Status",
+      "type": "stat",
+      "gridPos": {
+        "h": 4,
+        "w": 12,
+        "x": 0,
+        "y": 16
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "flight_delay_streaming_query_status",
+          "legendFormat": "{{query_name}} Status",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "title": "Query Failure Counter",
+      "type": "stat",
+      "gridPos": {
+        "h": 4,
+        "w": 12,
+        "x": 12,
+        "y": 16
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "sum(flight_delay_streaming_query_failures_total)",
+          "legendFormat": "Total Failures",
+          "refId": "A"
+        }
+      ]
+    }
+  ],
+  "refresh": "10s",
+  "schemaVersion": 38,
+  "style": "dark",
+  "tags": [
+    "flight-delay",
+    "streaming",
+    "spark",
+    "kafka"
+  ],
+  "time": {
+    "from": "now-30m",
+    "to": "now"
+  },
+  "title": "Streaming Pipeline Overview",
+  "uid": "flight-delay-streaming-overview"
+}

@@ -8,6 +8,7 @@ WORKDIR /app
 COPY --from=ghcr.io/astral-sh/uv:0.6.3 /uv /uvx /bin/
 COPY pyproject.toml uv.lock README.md ./
 COPY src/ ./src/
+COPY models/ ./models/
 
 RUN uv sync --frozen --no-dev
 
