@@ -26,18 +26,32 @@ from flight_delay.training.baseline import (
     validate_tracking_uri,
     validate_training_paths,
 )
+from flight_delay.training.inference import (
+    InferenceError,
+    ModelArtifactNotFoundError,
+    ModelLoadError,
+    ModelPredictor,
+    PredictionResult,
+    TargetLeakageDetectedError,
+)
 
 __all__ = [
     "CATEGORICAL_FEATURES",
     "NUMERICAL_FEATURES",
     "DataSplitError",
     "DatasetSplit",
+    "InferenceError",
     "MLflowTrackingError",
+    "ModelArtifactNotFoundError",
+    "ModelLoadError",
+    "ModelPredictor",
     "ModelTrainingError",
     "PathSafetyError",
+    "PredictionResult",
     "SchemaValidationError",
     "SplitConfig",
     "SplitMetadata",
+    "TargetLeakageDetectedError",
     "TrainingConfig",
     "assert_feature_columns",
     "build_logistic_regression_pipeline",

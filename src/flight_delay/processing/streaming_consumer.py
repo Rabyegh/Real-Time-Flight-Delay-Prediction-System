@@ -19,12 +19,16 @@ Delivery Guarantees & Duplicate Semantics:
 from __future__ import annotations
 
 import argparse
+import atexit
+import datetime
 import logging
 import sys
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
+import pandas as pd
 from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql.functions import (
     col,
@@ -45,8 +49,60 @@ from flight_delay.ingestion.contract import (
     contains_prohibited_leakage,
     get_spark_flight_event_schema,
 )
+from flight_delay.storage.cassandra import (
+    CassandraConfig,
+    CassandraStorage,
+    PredictionRecord,
+)
+from flight_delay.training.inference import ModelPredictor
 
 LOGGER = logging.getLogger(__name__)
+
+# Module-level worker process caches
+_WORKER_PREDICTOR: ModelPredictor | None = None
+_WORKER_STORAGE: CassandraStorage | None = None
+
+
+def get_worker_model_predictor(
+    model_path: Path | str,
+    threshold: float = 0.5,
+    model_version: str = "baseline-v1",
+) -> ModelPredictor:
+    """Return a process-level cached ModelPredictor instance."""
+    global _WORKER_PREDICTOR
+    if _WORKER_PREDICTOR is None:
+        _WORKER_PREDICTOR = ModelPredictor(
+            model_path=model_path,
+            threshold=threshold,
+            model_version=model_version,
+        )
+    return _WORKER_PREDICTOR
+
+
+def get_worker_cassandra_storage(
+    config: CassandraConfig,
+) -> CassandraStorage:
+    """Return a process-level cached CassandraStorage instance."""
+    global _WORKER_STORAGE
+    if _WORKER_STORAGE is None:
+        _WORKER_STORAGE = CassandraStorage(config=config)
+        _WORKER_STORAGE.connect()
+    return _WORKER_STORAGE
+
+
+def reset_worker_singletons() -> None:
+    """Reset worker singletons (used in testing and process teardown)."""
+    global _WORKER_PREDICTOR, _WORKER_STORAGE
+    if _WORKER_STORAGE is not None:
+        try:
+            _WORKER_STORAGE.close()
+        except Exception:
+            pass
+        _WORKER_STORAGE = None
+    _WORKER_PREDICTOR = None
+
+
+atexit.register(reset_worker_singletons)
 
 
 class StreamingPipelineError(RuntimeError):
@@ -75,6 +131,16 @@ class StreamingConfig:
     source_path: Path | str | None = None
     max_offsets_per_trigger: int | None = 1000
     starting_offsets: str = "latest"
+    # Phase 6: Cassandra real-time prediction pipeline options
+    enable_cassandra_predictions: bool = False
+    cassandra_host: str = "localhost"
+    cassandra_port: int = 9042
+    cassandra_keyspace: str = "flight_delay"
+    model_path: Path | str = Path("models/baseline/model.joblib")
+    model_threshold: float = 0.5
+    model_version: str = "baseline-v1"
+    prediction_chunk_size: int = 500
+    storage_factory: Callable[[], Any] | None = None
 
 
 def validate_streaming_paths(
@@ -245,11 +311,146 @@ def parse_and_validate_stream(
     return valid_with_time, rejected_stream
 
 
+def _process_prediction_chunk(
+    chunk_rows: list[Any],
+    predictor: ModelPredictor,
+    storage: Any,
+) -> None:
+    """Process a bounded chunk of rows: vectorized inference and Cassandra persistence."""
+    if not chunk_rows:
+        return
+
+    # Convert partition chunk to dicts for bounded pandas DataFrame
+    # Avoids whole-microbatch collection to driver memory
+    rows_dicts = [r.asDict() for r in chunk_rows]
+    chunk_pdf = pd.DataFrame(rows_dicts)
+    if chunk_pdf.empty:
+        return
+
+    # Consistent logical keys on replay/retry:
+    # Anchor prediction_time to event_time if not explicitly provided,
+    # ensuring identical clustering keys ((airport, prediction_date), prediction_time, event_id)
+    # across Spark micro-batch retries.
+    if "prediction_time" not in chunk_pdf.columns or chunk_pdf["prediction_time"].isna().all():
+        if "event_time" in chunk_pdf.columns:
+            chunk_pdf["prediction_time"] = chunk_pdf["event_time"]
+        elif "event_timestamp" in chunk_pdf.columns:
+            chunk_pdf["prediction_time"] = chunk_pdf["event_timestamp"]
+
+    # Run vectorized feature validation and prediction
+    enriched_pdf = predictor.predict_dataframe(chunk_pdf)
+
+    # Map to canonical PredictionRecord dataclasses
+    prediction_records: list[PredictionRecord] = []
+    for _, row in enriched_pdf.iterrows():
+        evt_time = row["event_time"]
+        if hasattr(evt_time, "to_pydatetime"):
+            evt_time = evt_time.to_pydatetime()
+        elif isinstance(evt_time, str):
+            evt_time = datetime.datetime.fromisoformat(evt_time.replace("Z", "+00:00"))
+
+        if evt_time.tzinfo is None:
+            evt_time = evt_time.replace(tzinfo=datetime.UTC)
+        else:
+            evt_time = evt_time.astimezone(datetime.UTC)
+
+        # Consistent logical keys on replay/retry:
+        # If prediction_time was not present in raw row, anchor to evt_time
+        # so that retries produce identical clustering keys
+        # ((airport, prediction_date), prediction_time, event_id)
+        if (
+            "prediction_time" in row
+            and pd.notna(row["prediction_time"])
+            and str(row["prediction_time"]).strip()
+        ):
+            pred_time = row["prediction_time"]
+            if hasattr(pred_time, "to_pydatetime"):
+                pred_time = pred_time.to_pydatetime()
+            elif isinstance(pred_time, str):
+                pred_time = datetime.datetime.fromisoformat(pred_time.replace("Z", "+00:00"))
+        else:
+            pred_time = evt_time
+
+        if pred_time.tzinfo is None:
+            pred_time = pred_time.replace(tzinfo=datetime.UTC)
+        else:
+            pred_time = pred_time.astimezone(datetime.UTC)
+
+        flight_num = str(row["flight_number"]) if pd.notna(row.get("flight_number")) else None
+
+        pred_record = PredictionRecord(
+            event_id=str(row["event_id"]),
+            carrier=str(row["carrier"]),
+            flight_number=flight_num,
+            origin=str(row["origin"]),
+            dest=str(row["dest"]),
+            event_time=evt_time,
+            prediction_time=pred_time,
+            delay_probability=float(row["delay_probability"]),
+            predicted_delayed=bool(row["predicted_delayed"]),
+            model_version=str(row["model_version"]),
+        )
+        prediction_records.append(pred_record)
+
+    storage.upsert_predictions_batch(prediction_records)
+
+
+def create_prediction_batch_handler(
+    model_path: Path | str,
+    cassandra_config: CassandraConfig,
+    threshold: float = 0.5,
+    model_version: str = "baseline-v1",
+    chunk_size: int = 500,
+    storage_factory: Callable[[], Any] | None = None,
+) -> Callable[[DataFrame, int], None]:
+    """Create a micro-batch handler for Spark Structured Streaming foreachBatch.
+
+    Executes:
+    - Partition-level bounded chunk processing via DataFrame.foreachPartition,
+      never collecting an unbounded stream or whole micro-batch into driver memory.
+    - Vectorized model inference using process-level cached ModelPredictor.
+    - Cassandra batch upsert using process-level cached session with prepared statements.
+    - Preserves deterministic event IDs and consistent timestamps for idempotent retries.
+    """
+    m_path = Path(model_path)
+    if not m_path.exists() or not m_path.is_file():
+        raise StreamingPipelineError(
+            f"Model artifact not found at '{m_path}'. "
+            "Ensure baseline model training (Phase 3) has executed."
+        )
+
+    def prediction_batch_handler(batch_df: DataFrame, batch_id: int) -> None:
+        def process_partition(partition_iter: Any) -> None:
+            predictor = get_worker_model_predictor(
+                model_path=m_path,
+                threshold=threshold,
+                model_version=model_version,
+            )
+            storage = (
+                storage_factory()
+                if storage_factory is not None
+                else get_worker_cassandra_storage(cassandra_config)
+            )
+
+            chunk_rows: list[Any] = []
+            for row in partition_iter:
+                chunk_rows.append(row)
+                if len(chunk_rows) >= chunk_size:
+                    _process_prediction_chunk(chunk_rows, predictor, storage)
+                    chunk_rows = []
+            if chunk_rows:
+                _process_prediction_chunk(chunk_rows, predictor, storage)
+
+        batch_df.foreachPartition(process_partition)
+
+    return prediction_batch_handler
+
+
 def build_streaming_query(
     spark: SparkSession,
     config: StreamingConfig,
 ) -> dict[str, StreamingQuery]:
-    """Build and start the streaming queries for valid and dead-letter sinks."""
+    """Build and start the streaming queries for valid, dead-letter, and prediction sinks."""
     v_path, r_path, c_path = validate_streaming_paths(
         config.valid_output_dir,
         config.rejected_output_dir,
@@ -344,6 +545,42 @@ def build_streaming_query(
             config.bootstrap_servers,
         )
 
+    # 6. Real-time model inference and Cassandra persistence sink
+    if config.enable_cassandra_predictions:
+        predictions_checkpoint = c_path / "predictions"
+        predictions_checkpoint.mkdir(parents=True, exist_ok=True)
+
+        cassandra_cfg = CassandraConfig(
+            contact_points=(config.cassandra_host,),
+            port=config.cassandra_port,
+            keyspace=config.cassandra_keyspace,
+        )
+
+        handler = create_prediction_batch_handler(
+            model_path=config.model_path,
+            cassandra_config=cassandra_cfg,
+            threshold=config.model_threshold,
+            model_version=config.model_version,
+            chunk_size=config.prediction_chunk_size,
+            storage_factory=config.storage_factory,
+        )
+
+        pred_writer = valid_df.writeStream.foreachBatch(handler).option(
+            "checkpointLocation", str(predictions_checkpoint)
+        )
+        if config.trigger_interval:
+            pred_writer = pred_writer.trigger(processingTime=config.trigger_interval)
+
+        pred_query = pred_writer.start()
+        queries["predictions"] = pred_query
+        LOGGER.info(
+            "Started Cassandra predictions streaming query -> %s:%d/%s (cp: %s)",
+            config.cassandra_host,
+            config.cassandra_port,
+            config.cassandra_keyspace,
+            predictions_checkpoint,
+        )
+
     return queries
 
 
@@ -409,6 +646,46 @@ def _build_argument_parser() -> argparse.ArgumentParser:
         default=None,
         help="Filesystem source path when --source-format=text",
     )
+    parser.add_argument(
+        "--cassandra",
+        dest="enable_cassandra",
+        action="store_true",
+        default=True,
+        help="Enable Cassandra prediction persistence stream (default: True)",
+    )
+    parser.add_argument(
+        "--no-cassandra",
+        dest="enable_cassandra",
+        action="store_false",
+        help="Disable Cassandra prediction persistence stream",
+    )
+    parser.add_argument(
+        "--cassandra-host",
+        default=settings.cassandra_host,
+        help=f"Cassandra host (default: {settings.cassandra_host})",
+    )
+    parser.add_argument(
+        "--cassandra-port",
+        type=int,
+        default=settings.cassandra_port,
+        help=f"Cassandra port (default: {settings.cassandra_port})",
+    )
+    parser.add_argument(
+        "--cassandra-keyspace",
+        default=settings.cassandra_keyspace,
+        help=f"Cassandra keyspace (default: {settings.cassandra_keyspace})",
+    )
+    parser.add_argument(
+        "--model-path",
+        default=settings.model_artifact_path,
+        help=f"Path to trained baseline model artifact (default: {settings.model_artifact_path})",
+    )
+    parser.add_argument(
+        "--model-threshold",
+        type=float,
+        default=0.5,
+        help="Classification decision threshold (default: 0.5)",
+    )
     return parser
 
 
@@ -433,6 +710,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         dead_letter_topic=args.dlq_topic,
         source_format=args.source_format,
         source_path=args.source_path,
+        enable_cassandra_predictions=args.enable_cassandra,
+        cassandra_host=args.cassandra_host,
+        cassandra_port=args.cassandra_port,
+        cassandra_keyspace=args.cassandra_keyspace,
+        model_path=args.model_path,
+        model_threshold=args.model_threshold,
     )
 
     spark = create_streaming_spark_session()

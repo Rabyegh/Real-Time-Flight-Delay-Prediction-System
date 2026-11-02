@@ -28,6 +28,8 @@ class Settings(BaseSettings):
     streaming_trigger_interval: str = "5 seconds"
     cassandra_host: str = "localhost"
     cassandra_port: int = Field(default=9042, ge=1, le=65535)
+    cassandra_keyspace: str = "flight_delay"
+    model_artifact_path: str = "models/baseline/model.joblib"
     mlflow_tracking_uri: str = "http://localhost:5000"
     api_port: int = Field(default=8000, ge=1, le=65535)
     kafka_external_port: int = Field(default=9092, ge=1, le=65535)
